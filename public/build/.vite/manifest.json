@@ -1,0 +1,83 @@
+{
+  "_index-DCHLVxcr.js": {
+    "file": "assets/index-DCHLVxcr.js",
+    "name": "index",
+    "isDynamicEntry": true,
+    "imports": [
+      "src/main.jsx"
+    ]
+  },
+  "node_modules/@monaco-editor/react/dist/index.mjs": {
+    "file": "assets/index-C5a4aGDr.js",
+    "name": "index",
+    "src": "node_modules/@monaco-editor/react/dist/index.mjs",
+    "isDynamicEntry": true,
+    "imports": [
+      "src/main.jsx"
+    ]
+  },
+  "node_modules/react-quill/dist/quill.snow.css": {
+    "file": "assets/quill-DZrYvFpI.css",
+    "src": "node_modules/react-quill/dist/quill.snow.css"
+  },
+  "src/components/ChartModal.jsx": {
+    "file": "assets/ChartModal-CNDtXpeM.js",
+    "name": "ChartModal",
+    "src": "src/components/ChartModal.jsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "src/main.jsx"
+    ]
+  },
+  "src/components/Dashboard.jsx": {
+    "file": "assets/Dashboard-CycX21Z-.js",
+    "name": "Dashboard",
+    "src": "src/components/Dashboard.jsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "src/main.jsx"
+    ],
+    "dynamicImports": [
+      "src/components/ChartModal.jsx"
+    ]
+  },
+  "src/components/GanttChart.jsx": {
+    "file": "assets/GanttChart-9HV4yjG4.js",
+    "name": "GanttChart",
+    "src": "src/components/GanttChart.jsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "src/main.jsx"
+    ]
+  },
+  "src/components/mobile/MobileLayout.jsx": {
+    "file": "assets/MobileLayout-VYRTxGtU.js",
+    "name": "MobileLayout",
+    "src": "src/components/mobile/MobileLayout.jsx",
+    "isDynamicEntry": true,
+    "imports": [
+      "src/main.jsx"
+    ],
+    "dynamicImports": [
+      "src/components/Dashboard.jsx"
+    ]
+  },
+  "src/main.jsx": {
+    "file": "assets/main-DnSpPjed.js",
+    "name": "main",
+    "src": "src/main.jsx",
+    "isEntry": true,
+    "dynamicImports": [
+      "node_modules/@monaco-editor/react/dist/index.mjs",
+      "src/components/GanttChart.jsx",
+      "_index-DCHLVxcr.js",
+      "src/components/GanttChart.jsx",
+      "src/components/Dashboard.jsx",
+      "src/components/ChartModal.jsx",
+      "src/components/mobile/MobileLayout.jsx"
+    ],
+    "css": [
+      "assets/main-Zl4wcFhJ.css"
+    ]
+  }
+}
