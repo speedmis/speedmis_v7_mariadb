@@ -144,7 +144,7 @@ if ($step === 2 && $_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors[] = 'PHP pdo_mysql 확장이 설치되어 있지 않습니다. (php-mysql 패키지 필요)';
     }
 
-    // 1) 서버 접속 + DB 생성
+    // 1) 서버 접속 + DB 생성 (공유 호스팅은 CREATE DATABASE 권한이 없을 수 있어 graceful fallback)
     if (empty($errors)) {
         try {
             $dsnServer = "mysql:host={$dbHost};port={$dbPort};charset=utf8mb4";
@@ -155,13 +155,19 @@ if ($step === 2 && $_SERVER['REQUEST_METHOD'] === 'POST') {
             $exists = $pdo->prepare('SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?');
             $exists->execute([$dbName]);
             if ($exists->fetchColumn() === false) {
-                $pdo->exec("CREATE DATABASE `{$dbName}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
-                $log[] = "데이터베이스 생성: {$dbName}";
+                // CREATE 시도 — 권한 없으면 다음 step 에서 사용자에게 안내
+                try {
+                    $pdo->exec("CREATE DATABASE `{$dbName}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+                    $log[] = "데이터베이스 생성: {$dbName}";
+                } catch (PDOException $e2) {
+                    $log[] = "⚠ DB 자동 생성 권한이 없어 보입니다 (공유호스팅 등 흔한 케이스).";
+                    $log[] = "  → 호스팅 관리자 페이지에서 '{$dbName}' DB 를 미리 만들고 다시 시도하세요.";
+                }
             } else {
                 $log[] = "기존 데이터베이스 사용: {$dbName}";
             }
         } catch (PDOException $e) {
-            $errors[] = 'DB 서버 연결/생성 실패: ' . $e->getMessage();
+            $errors[] = 'DB 서버 연결 실패: ' . $e->getMessage();
         }
     }
 
