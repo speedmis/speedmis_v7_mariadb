@@ -6,6 +6,7 @@ import Messenger from './components/Messenger';
 import MainContent from './components/MainContent';
 import Toast, { showToast } from './components/Toast';
 import MenuAddDialog from './components/MenuAddDialog';
+import EnvManageNotice from './components/EnvManageNotice';
 import useMobileMode from './hooks/useMobileMode';
 
 const MobileLayout = lazy(() => import('./components/mobile/MobileLayout'));
@@ -148,6 +149,23 @@ export default function App() {
         btn.style.pointerEvents = prevDisabled;
         btn.style.opacity = '';
       }
+    };
+    document.addEventListener('click', handler, true);
+    return () => document.removeEventListener('click', handler, true);
+  }, []);
+
+  // data-mis-img — 그리드/__html 이미지 클릭 시 현재 페이지에서 라이트박스로 크게 보기
+  //   속성: data-mis-img(원본/큰이미지 URL), data-mis-img-name(캡션, optional)
+  useEffect(() => {
+    const handler = (e) => {
+      const el = e.target.closest('[data-mis-img]');
+      if (!el) return;
+      const url = el.dataset.misImg || '';
+      if (!url) return;
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      const name = el.dataset.misImgName || (url.split('/').pop() || '');
+      window.dispatchEvent(new CustomEvent('mis:imageView', { detail: { url, name } }));
     };
     document.addEventListener('click', handler, true);
     return () => document.removeEventListener('click', handler, true);
@@ -423,6 +441,7 @@ function AppContent({ user, menuTree, onLogout, siteTitle, homeGubun, homeTopRea
           />
         </Suspense>
         <Messenger mode={msgMode} setMode={setMsgMode} onUnreadChange={setMsgUnread} />
+        <EnvManageNotice user={user} />
       </>
     );
   }
@@ -442,6 +461,7 @@ function AppContent({ user, menuTree, onLogout, siteTitle, homeGubun, homeTopRea
       msgUnread={msgUnread}
     />
     <Messenger mode={msgMode} setMode={setMsgMode} onUnreadChange={setMsgUnread} />
+    <EnvManageNotice user={user} />
     </>
   );
 }
