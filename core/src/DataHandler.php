@@ -231,7 +231,8 @@ class DataHandler
         if (
             ($params['dev_mode']    ?? '') !== '1' &&
             ($params['_simple']     ?? '') !== '1' &&
-            ($params['_xlsStream']  ?? '') !== '1'
+            ($params['_xlsStream']  ?? '') !== '1' &&
+            ($params['customAction'] ?? '') === ''   // 커스텀버튼 액션은 list_json_init 에서 데이터를 바꿀 수 있어 캐시 우회(=fresh)
         ) {
             if ($cached = $this->cache->get($cacheKey)) {
                 $GLOBALS['_client_alert'] = null;
@@ -1445,6 +1446,8 @@ class DataHandler
         if (!empty($GLOBALS['_client_openTab'])) $result['_client_openTab'] = $GLOBALS['_client_openTab'];
         // 훅이 edited 행 이외 값도 바꿀 수 있음을 알리는 신호 — 클라이언트가 해당 행 재조회하도록
         if (!empty($GLOBALS['_listEditReload'])) $result['_listEditReload'] = true;
+        // 다른 행까지 영향받았을 때 — 클라이언트가 전체 목록 reload 하도록 (예: 267 aliasFix)
+        if (!empty($GLOBALS['_listFullReload'])) $result['_listFullReload'] = true;
         // 저장 후 modify 폼 유지 (view 전환 안 함)
         if (!empty($GLOBALS['_client_stayOnModify'])) $result['_stayOnModify'] = true;
 
@@ -1957,6 +1960,15 @@ class DataHandler
 
         $result = array_merge($params, $body);
         $this->callHook('addLogic_treat', $result);
+
+        // 훅이 데이터를 변경하고 목록/뷰 리로드를 요청하면(reloadList/reloadView),
+        // 직후의 mis:reloadGrid → list() 가 stale 캐시를 받지 않도록 이 프로그램 캐시를 무효화.
+        // (정상 save 흐름과 달리 treat 훅의 직접 INSERT/UPDATE/DELETE 는 자동 무효화가 없어
+        //  새로 추가한 행이 캐시 만료 전까지 안 보이는 레이스를 유발했음)
+        if (!empty($result['reloadList']) || !empty($result['reloadView'])) {
+            $rp = (string)($menu['real_pid'] ?? '');
+            try { $this->cache->invalidateByRealPid($rp !== '' ? $rp : "g{$gubun}"); } catch (\Throwable) {}
+        }
 
         return ['success' => true, 'data' => $result];
     }
