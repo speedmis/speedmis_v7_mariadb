@@ -693,6 +693,124 @@ export default function DataForm({ gubun, idx, mode, user, onSaved, onCancel, on
     </div>
   );
 
+  // 액션 버튼 — 폼 상단/하단 동일 구성 (모든 speedmis 공통 요구사항)
+  //   - renderEditActions: 수정/등록 모드 (저장 / 저장후 새로입력 / 취소·닫기)
+  //   - renderViewActions: 조회 모드   (수정·부분수정 / 인쇄 / 삭제 + 읽기전용 뱃지)
+  // 두 곳에서 같은 핸들러를 공유하므로 saving/deleting 상태가 양쪽에 즉시 반영됨.
+  const renderEditActions = (wrapClass) => {
+    const isPopup = new URLSearchParams(window.location.search).get('isPopup') === 'Y';
+    return (
+      <div className={wrapClass}>
+        <button
+          type="submit"
+          disabled={saving}
+          onClick={() => { submitModeRef.current = 'normal'; }}
+          className="h-btn px-5 rounded bg-accent text-white text-base font-medium border-0 cursor-pointer disabled:opacity-50 hover:bg-accent-hover transition-colors flex items-center gap-2"
+        >
+          {saving && <span className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />}
+          {saving ? '저장 중...' : '저장'}
+        </button>
+        {saveAndNew && mode === 'modify' && (
+          <button
+            type="submit"
+            disabled={saving}
+            onClick={() => { submitModeRef.current = 'thenWrite'; }}
+            className="h-btn px-5 rounded bg-surface border border-accent text-primary text-base font-medium cursor-pointer disabled:opacity-50 hover:bg-accent/10 transition-colors"
+            title="저장 후 새로입력 모드로 전환"
+          >저장후 새로입력</button>
+        )}
+        <button
+          type="button"
+          className="h-btn px-5 rounded bg-surface border border-border-base text-secondary text-base cursor-pointer hover:bg-surface-2 hover:text-primary transition-colors"
+          onClick={() => {
+            clearDirty();
+            // 팝업(iframe) 모드면 부모창에 닫기 요청, 아니면 취소(폼 닫기)
+            if (isPopup && window.parent !== window) {
+              try { window.parent.postMessage({ type: 'mis:closePopup' }, '*'); } catch {}
+            } else {
+              onCancel?.();
+            }
+          }}
+        >{isPopup ? '닫기' : '취소'}</button>
+      </div>
+    );
+  };
+
+  const renderViewActions = (wrapClass) => {
+    // rowReadOnly 행이라도 max_length 가 ! 로 끝나는 필드(override) 가 있으면 수정 모드로 진입 가능 — 그 필드만 편집됨
+    const _hasOverride = formFields.some(isOverrideField);
+    const _showModify  = !rowReadOnly || _hasOverride;
+    return (
+      <div className={wrapClass}>
+        {_showModify && (
+          <button
+            type="button"
+            className="h-btn px-5 rounded bg-accent text-white text-base font-medium border-0 cursor-pointer hover:bg-accent-hover transition-colors"
+            onClick={() => onModify?.()}
+          >{rowReadOnly ? '부분수정' : '수정'}</button>
+        )}
+        {rowReadOnly && !_hasOverride && (
+          <span className="text-xs px-2 py-1.5 rounded bg-surface-2 text-muted font-bold self-center">🔒 읽기전용 행</span>
+        )}
+        {rowReadOnly && _hasOverride && (
+          <span className="text-xs px-2 py-1.5 rounded bg-surface-2 text-muted font-bold self-center">🔒 읽기전용 행 (일부 필드만 수정 가능)</span>
+        )}
+        {printHtml && (
+          <button
+            type="button"
+            className="h-btn px-5 rounded bg-surface border border-border-base text-primary text-base cursor-pointer hover:bg-surface-2 transition-colors"
+            onClick={() => {
+              const w = window.open('', '_blank', 'width=900,height=700');
+              if (!w) return;
+              w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>인쇄</title>
+                <style>body{font-family:Pretendard,sans-serif;padding:20px;font-size:13px;color:#191F28}
+                table{border-collapse:collapse;width:100%} th,td{border:1px solid #E5E8EB;padding:6px 10px;text-align:left}
+                th{background:#F5F6F8;font-weight:600} h1,h2,h3{margin:0 0 12px}
+                .no-print{margin-top:24px;text-align:center}
+                @media print{.no-print{display:none!important}}</style>
+                </head><body>${printHtml}
+                <div class="no-print">
+                  <button onclick="window.print()" style="padding:10px 32px;font-size:15px;cursor:pointer;border:1px solid #E5E8EB;border-radius:10px;background:#4F6EF7;color:#fff;font-weight:600">🖨 인쇄하기</button>
+                  <button onclick="window.close()" style="padding:10px 32px;font-size:15px;cursor:pointer;border:1px solid #E5E8EB;border-radius:10px;margin-left:8px;background:#fff;color:#4E5968;font-weight:600">닫기</button>
+                </div></body></html>`);
+              w.document.close();
+              setTimeout(() => w.print(), 300);
+            }}
+          >🖨 인쇄</button>
+        )}
+        {onDelete && !rowReadOnly && (
+          <button
+            type="button"
+            disabled={deleting}
+            className="h-btn px-5 rounded bg-surface border border-danger text-danger text-base cursor-pointer disabled:opacity-50 hover:bg-danger-dim transition-colors flex items-center gap-2"
+            onClick={async () => {
+              if (!window.confirm('삭제하시겠습니까?')) return;
+              setDeleting(true);
+              try {
+                const res = await api.delete(gubun, idx);
+                // 사용자 정의 메시지 우선, 없으면 기본 '삭제되었습니다.'
+                if (res?._client_alert) alert(res._client_alert);
+                if (res?._client_toast) showToast(res._client_toast);
+                else if (!res?._client_alert) showToast('삭제되었습니다.', 'success');
+                onDelete?.();
+              } catch (e) {
+                showToast(e.message, 'error');
+              } finally {
+                setDeleting(false);
+              }
+            }}
+          >
+            {deleting && <span className="inline-block w-3 h-3 border-2 border-danger border-t-transparent rounded-full animate-spin" />}
+            {deleting ? '삭제 중...' : '삭제'}
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  const showEditActions = !readOnly && !hideActions && !menuReadOnly;
+  const showViewActions =  readOnly && !hideActions && !menuReadOnly;
+
   return (
     <form onSubmit={handleSubmit} className={activeIsCode || activeIsGantt ? 'flex flex-col h-full' : ''}>
       {/* 에러 */}
@@ -701,6 +819,10 @@ export default function DataForm({ gubun, idx, mode, user, onSaved, onCancel, on
           {error}
         </div>
       )}
+
+      {/* 액션 버튼 (상단) — 하단과 동일 구성 미러링 */}
+      {showEditActions && renderEditActions("flex gap-2 mb-3 flex-shrink-0")}
+      {showViewActions && renderViewActions("flex gap-2 mb-3 flex-shrink-0")}
 
       {/* 서버 주입 폼 버튼 (_client_formButtons)
           - b.action 있으면: treat API 호출 후 리스트로 복귀 (onDelete: 패널 닫기 + 목록 새로고침)
@@ -1196,116 +1318,9 @@ export default function DataForm({ gubun, idx, mode, user, onSaved, onCancel, on
         </div>
       )}
 
-      {/* 액션 버튼 - 수정/저장 모드 */}
-      {!readOnly && !hideActions && !menuReadOnly && (
-        <div className="flex gap-2 mt-4 flex-shrink-0">
-          <button
-            type="submit"
-            disabled={saving}
-            onClick={() => { submitModeRef.current = 'normal'; }}
-            className="h-btn px-5 rounded bg-accent text-white text-base font-medium border-0 cursor-pointer disabled:opacity-50 hover:bg-accent-hover transition-colors flex items-center gap-2"
-          >
-            {saving && <span className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />}
-            {saving ? '저장 중...' : '저장'}
-          </button>
-          {saveAndNew && mode === 'modify' && (
-            <button
-              type="submit"
-              disabled={saving}
-              onClick={() => { submitModeRef.current = 'thenWrite'; }}
-              className="h-btn px-5 rounded bg-surface border border-accent text-primary text-base font-medium cursor-pointer disabled:opacity-50 hover:bg-accent/10 transition-colors"
-              title="저장 후 새로입력 모드로 전환"
-            >저장후 새로입력</button>
-          )}
-          <button
-            type="button"
-            className="h-btn px-5 rounded bg-surface border border-border-base text-secondary text-base cursor-pointer hover:bg-surface-2 hover:text-primary transition-colors"
-            onClick={() => {
-              clearDirty();
-              // 팝업(iframe) 모드면 부모창에 닫기 요청, 아니면 취소(폼 닫기)
-              const isPopup = new URLSearchParams(window.location.search).get('isPopup') === 'Y';
-              if (isPopup && window.parent !== window) {
-                try { window.parent.postMessage({ type: 'mis:closePopup' }, '*'); } catch {}
-              } else {
-                onCancel?.();
-              }
-            }}
-          >{new URLSearchParams(window.location.search).get('isPopup') === 'Y' ? '닫기' : '취소'}</button>
-        </div>
-      )}
-
-      {/* 액션 버튼 - 조회 모드 */}
-      {readOnly && !hideActions && !menuReadOnly && (() => {
-        // rowReadOnly 행이라도 max_length 가 ! 로 끝나는 필드(override) 가 있으면 수정 모드로 진입 가능 — 그 필드만 편집됨
-        const _hasOverride = formFields.some(isOverrideField);
-        const _showModify  = !rowReadOnly || _hasOverride;
-        return (
-        <div className="flex gap-2 mt-4">
-          {_showModify && (
-          <button
-            type="button"
-            className="h-btn px-5 rounded bg-accent text-white text-base font-medium border-0 cursor-pointer hover:bg-accent-hover transition-colors"
-            onClick={() => onModify?.()}
-          >{rowReadOnly ? '부분수정' : '수정'}</button>
-          )}
-          {rowReadOnly && !_hasOverride && (
-            <span className="text-xs px-2 py-1.5 rounded bg-surface-2 text-muted font-bold self-center">🔒 읽기전용 행</span>
-          )}
-          {rowReadOnly && _hasOverride && (
-            <span className="text-xs px-2 py-1.5 rounded bg-surface-2 text-muted font-bold self-center">🔒 읽기전용 행 (일부 필드만 수정 가능)</span>
-          )}
-          {printHtml && (
-            <button
-              type="button"
-              className="h-btn px-5 rounded bg-surface border border-border-base text-primary text-base cursor-pointer hover:bg-surface-2 transition-colors"
-              onClick={() => {
-                const w = window.open('', '_blank', 'width=900,height=700');
-                if (!w) return;
-                w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>인쇄</title>
-                  <style>body{font-family:Pretendard,sans-serif;padding:20px;font-size:13px;color:#191F28}
-                  table{border-collapse:collapse;width:100%} th,td{border:1px solid #E5E8EB;padding:6px 10px;text-align:left}
-                  th{background:#F5F6F8;font-weight:600} h1,h2,h3{margin:0 0 12px}
-                  .no-print{margin-top:24px;text-align:center}
-                  @media print{.no-print{display:none!important}}</style>
-                  </head><body>${printHtml}
-                  <div class="no-print">
-                    <button onclick="window.print()" style="padding:10px 32px;font-size:15px;cursor:pointer;border:1px solid #E5E8EB;border-radius:10px;background:#4F6EF7;color:#fff;font-weight:600">🖨 인쇄하기</button>
-                    <button onclick="window.close()" style="padding:10px 32px;font-size:15px;cursor:pointer;border:1px solid #E5E8EB;border-radius:10px;margin-left:8px;background:#fff;color:#4E5968;font-weight:600">닫기</button>
-                  </div></body></html>`);
-                w.document.close();
-                setTimeout(() => w.print(), 300);
-              }}
-            >🖨 인쇄</button>
-          )}
-          {onDelete && !rowReadOnly && (
-            <button
-              type="button"
-              disabled={deleting}
-              className="h-btn px-5 rounded bg-surface border border-danger text-danger text-base cursor-pointer disabled:opacity-50 hover:bg-danger-dim transition-colors flex items-center gap-2"
-              onClick={async () => {
-                if (!window.confirm('삭제하시겠습니까?')) return;
-                setDeleting(true);
-                try {
-                  const res = await api.delete(gubun, idx);
-                  // 사용자 정의 메시지 우선, 없으면 기본 '삭제되었습니다.'
-                  if (res?._client_alert) alert(res._client_alert);
-                  if (res?._client_toast) showToast(res._client_toast);
-                  else if (!res?._client_alert) showToast('삭제되었습니다.', 'success');
-                  onDelete?.();
-                } catch (e) {
-                  showToast(e.message, 'error');
-                } finally {
-                  setDeleting(false);
-                }
-              }}
-            >
-              {deleting && <span className="inline-block w-3 h-3 border-2 border-danger border-t-transparent rounded-full animate-spin" />}
-              {deleting ? '삭제 중...' : '삭제'}
-            </button>
-          )}
-        </div>
-        );
-      })()}
+      {/* 액션 버튼 (하단) — 상단과 동일 구성 (helper 재사용) */}
+      {showEditActions && renderEditActions("flex gap-2 mt-4 flex-shrink-0")}
+      {showViewActions && renderViewActions("flex gap-2 mt-4")}
 
       {/* 서버 훅 _client_belowForm — 폼 하단 패널 (sibling 이력 등) */}
       {belowForm && belowForm.type === 'siblingList' && Array.isArray(belowForm.rows) && belowForm.rows.length > 0 && (
@@ -3234,8 +3249,11 @@ function renderInput(field, val, readOnly, onChange, hRows = 1, gubun = 0, input
   }
 
   // 객체명(컨트롤)이 없으면 → 읽기전용 텍스트 출력 (입력글수만 있어도 편집 불가)
+  // schema_type 에 ^^ 포맷(예: number^^#,##0, date^^MM-dd) 이 있으면 그대로 적용
   if (!ctlName) {
-    return <span className={"w-full h-full px-2 text-base text-secondary bg-transparent cursor-default flex items-center" + flexAlignCls}>{val ?? ''}</span>;
+    const hasFmt = typeof type === 'string' && type.includes('^^');
+    const display = hasFmt ? formatBySchema(val, type) : (val ?? '');
+    return <span className={"w-full h-full px-2 text-base text-secondary bg-transparent cursor-default flex items-center" + flexAlignCls}>{display}</span>;
   }
   const items   = field.items ?? '';
 
