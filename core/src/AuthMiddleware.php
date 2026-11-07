@@ -13,7 +13,7 @@ use Slim\Psr7\Response;
 class AuthMiddleware implements MiddlewareInterface
 {
     /** act= 값 중 인증 불필요 목록 (외부 프린터 등 비-브라우저 클라이언트용 qrPrint 포함) */
-    private const PUBLIC_ACTS = ['login', 'logout', 'refresh', 'ping', 'csrf', 'qrPrint', 'qrPrint.nocount'];
+    private const PUBLIC_ACTS = ['login', 'logout', 'refresh', 'ping', 'csrf', 'qrPrint', 'qrPrint.nocount', 'otpVerify', 'fidoLoginOptions', 'fidoLoginVerify'];
 
     public function process(ServerRequestInterface $request, RequestHandlerInterface $handler): ResponseInterface
     {

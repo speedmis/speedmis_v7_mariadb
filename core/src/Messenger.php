@@ -48,17 +48,50 @@ class Messenger
         $auth     = (string)($sub['keys']['auth'] ?? '');
         if ($endpoint === '' || $p256dh === '' || $auth === '') return false;
 
-        $stmt = $this->pdo->prepare(
-            "INSERT INTO mis_push_subscriptions
-               (user_id, endpoint, p256dh, auth_key, ua, ip, device_label, is_active, last_used_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'Y', NOW())
-             ON DUPLICATE KEY UPDATE
-               user_id=VALUES(user_id),
-               p256dh=VALUES(p256dh), auth_key=VALUES(auth_key),
-               ua=VALUES(ua), ip=VALUES(ip), device_label=VALUES(device_label),
-               is_active='Y', fail_count=0, last_used_at=NOW()"
-        );
-        $stmt->execute([$userId, $endpoint, $p256dh, $auth, $ua, $ip, $deviceLabel]);
+        $driver = $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME);
+        $now = $driver === 'sqlsrv' ? 'GETDATE()' : ($driver === 'pgsql' ? 'NOW()' : 'NOW()');
+
+        if ($driver === 'sqlsrv') {
+            // MSSQL: MERGE
+            $sql = "MERGE mis_push_subscriptions AS t
+                USING (SELECT ? AS endpoint) AS s ON t.endpoint = s.endpoint
+                WHEN MATCHED THEN UPDATE SET
+                    user_id=?, p256dh=?, auth_key=?, ua=?, ip=?, device_label=?,
+                    is_active='Y', fail_count=0, last_used_at=$now
+                WHEN NOT MATCHED THEN INSERT
+                    (user_id, endpoint, p256dh, auth_key, ua, ip, device_label, is_active, last_used_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'Y', $now);";
+            $stmt = $this->pdo->prepare($sql);
+            $stmt->execute([
+                $endpoint,
+                $userId, $p256dh, $auth, $ua, $ip, $deviceLabel,
+                $userId, $endpoint, $p256dh, $auth, $ua, $ip, $deviceLabel,
+            ]);
+        } elseif ($driver === 'pgsql') {
+            // PostgreSQL: ON CONFLICT
+            $sql = "INSERT INTO mis_push_subscriptions
+                (user_id, endpoint, p256dh, auth_key, ua, ip, device_label, is_active, last_used_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'Y', $now)
+                ON CONFLICT (endpoint) DO UPDATE SET
+                    user_id=EXCLUDED.user_id, p256dh=EXCLUDED.p256dh, auth_key=EXCLUDED.auth_key,
+                    ua=EXCLUDED.ua, ip=EXCLUDED.ip, device_label=EXCLUDED.device_label,
+                    is_active='Y', fail_count=0, last_used_at=$now";
+            $stmt = $this->pdo->prepare($sql);
+            $stmt->execute([$userId, $endpoint, $p256dh, $auth, $ua, $ip, $deviceLabel]);
+        } else {
+            // MySQL/MariaDB
+            $stmt = $this->pdo->prepare(
+                "INSERT INTO mis_push_subscriptions
+                   (user_id, endpoint, p256dh, auth_key, ua, ip, device_label, is_active, last_used_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'Y', $now)
+                 ON DUPLICATE KEY UPDATE
+                   user_id=VALUES(user_id),
+                   p256dh=VALUES(p256dh), auth_key=VALUES(auth_key),
+                   ua=VALUES(ua), ip=VALUES(ip), device_label=VALUES(device_label),
+                   is_active='Y', fail_count=0, last_used_at=$now"
+            );
+            $stmt->execute([$userId, $endpoint, $p256dh, $auth, $ua, $ip, $deviceLabel]);
+        }
         return true;
     }
 

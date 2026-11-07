@@ -20,6 +20,15 @@ class FileManager
 {
     private const MAX_SIZE = 20 * 1024 * 1024; // 20 MB
 
+    /** 실행 가능한 위험 확장자 — 모든 업로드 경로에서 공용 차단 */
+    public const DANGEROUS_EXTS = [
+        'exe','bat','cmd','com','msi','scr','pif','vbs','vbe','js','jse',
+        'ws','wsf','wsc','wsh','ps1','ps2','psc1','psc2','msp','mst',
+        'cpl','hta','inf','ins','isp','reg','rgs','sct','shb','shs',
+        'lnk','dll','sys','drv','ocx','php','phtml','php3','php4','php5',
+        'asp','aspx','jsp','cgi','pl','py','rb','sh','bash',
+    ];
+
     public function __construct(
         private \PDO            $pdo,
         private LoggerInterface $logger
@@ -42,6 +51,11 @@ class FileManager
         $origName = $file->getClientFilename() ?? 'unknown';
         $mime     = $file->getClientMediaType() ?? 'application/octet-stream';
         $ext      = strtolower(pathinfo($origName, PATHINFO_EXTENSION));
+
+        // 실행 가능한 파일 차단 — 서버 보안
+        if (in_array($ext, self::DANGEROUS_EXTS)) {
+            return ['success' => false, 'message' => "실행 가능한 파일({$ext})은 보안상 업로드할 수 없습니다. 압축파일(zip, 7z 등)로 변환하여 올려주세요."];
+        }
 
         // 고유 토큰 폴더
         $token    = bin2hex(random_bytes(12));

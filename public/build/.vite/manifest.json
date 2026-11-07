@@ -1,6 +1,14 @@
 {
-  "_index-cgIWNQfS.js": {
-    "file": "assets/index-cgIWNQfS.js",
+  "_image-resize.min-zEdxToh_.js": {
+    "file": "assets/image-resize.min-zEdxToh_.js",
+    "name": "image-resize.min",
+    "isDynamicEntry": true,
+    "imports": [
+      "src/main.jsx"
+    ]
+  },
+  "_index-C2Co2AP2.js": {
+    "file": "assets/index-C2Co2AP2.js",
     "name": "index",
     "isDynamicEntry": true,
     "imports": [
@@ -8,7 +16,7 @@
     ]
   },
   "node_modules/@monaco-editor/react/dist/index.mjs": {
-    "file": "assets/index-DK1aDXMc.js",
+    "file": "assets/index-B-9v109c.js",
     "name": "index",
     "src": "node_modules/@monaco-editor/react/dist/index.mjs",
     "isDynamicEntry": true,
@@ -21,7 +29,7 @@
     "src": "node_modules/react-quill/dist/quill.snow.css"
   },
   "src/components/ChartModal.jsx": {
-    "file": "assets/ChartModal-td7wQCv4.js",
+    "file": "assets/ChartModal-CvCXeGap.js",
     "name": "ChartModal",
     "src": "src/components/ChartModal.jsx",
     "isDynamicEntry": true,
@@ -30,7 +38,7 @@
     ]
   },
   "src/components/Dashboard.jsx": {
-    "file": "assets/Dashboard-Bl05krb6.js",
+    "file": "assets/Dashboard-CCuQTUYY.js",
     "name": "Dashboard",
     "src": "src/components/Dashboard.jsx",
     "isDynamicEntry": true,
@@ -42,7 +50,7 @@
     ]
   },
   "src/components/GanttChart.jsx": {
-    "file": "assets/GanttChart-DuaASzlV.js",
+    "file": "assets/GanttChart-hdbNizqi.js",
     "name": "GanttChart",
     "src": "src/components/GanttChart.jsx",
     "isDynamicEntry": true,
@@ -51,7 +59,7 @@
     ]
   },
   "src/components/mobile/MobileLayout.jsx": {
-    "file": "assets/MobileLayout-Bgc7Kfi1.js",
+    "file": "assets/MobileLayout-CEVl84ht.js",
     "name": "MobileLayout",
     "src": "src/components/mobile/MobileLayout.jsx",
     "isDynamicEntry": true,
@@ -63,22 +71,23 @@
     ]
   },
   "src/main.jsx": {
-    "file": "assets/main-CrG7th28.js",
+    "file": "assets/main-CVRPeBAW.js",
     "name": "main",
     "src": "src/main.jsx",
     "isEntry": true,
     "dynamicImports": [
       "node_modules/@monaco-editor/react/dist/index.mjs",
       "src/components/GanttChart.jsx",
-      "_index-cgIWNQfS.js",
-      "_index-cgIWNQfS.js",
+      "_index-C2Co2AP2.js",
+      "_image-resize.min-zEdxToh_.js",
+      "_index-C2Co2AP2.js",
       "src/components/GanttChart.jsx",
       "src/components/Dashboard.jsx",
       "src/components/ChartModal.jsx",
       "src/components/mobile/MobileLayout.jsx"
     ],
     "css": [
-      "assets/main-BG3XQN8Q.css"
+      "assets/main-C9GJZbNU.css"
     ]
   }
 }

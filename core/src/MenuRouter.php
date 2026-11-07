@@ -43,6 +43,8 @@ class MenuRouter
             );
             $stmt->execute([$gubun]);
             $menu = $stmt->fetch() ?: [];
+            // bit(1) 컬럼 정수 변환 (MSSQL PDO는 바이너리, MariaDB는 정수로 반환)
+            if (isset($menu['is_use_print'])) $menu['is_use_print'] = is_int($menu['is_use_print']) ? $menu['is_use_print'] : (int)ord($menu['is_use_print']);
             if (isset($menu['add_url'])) $menu['add_url'] = self::resolveAddUrlPlaceholders($menu['add_url']);
             return $this->applyMisJoinInheritance($menu);
         } catch (\Throwable $e) {
@@ -65,6 +67,8 @@ class MenuRouter
             );
             $stmt->execute([$realPid]);
             $menu = $stmt->fetch() ?: [];
+            // bit(1) 컬럼 정수 변환 (MSSQL PDO는 바이너리, MariaDB는 정수로 반환)
+            if (isset($menu['is_use_print'])) $menu['is_use_print'] = is_int($menu['is_use_print']) ? $menu['is_use_print'] : (int)ord($menu['is_use_print']);
             if (isset($menu['add_url'])) $menu['add_url'] = self::resolveAddUrlPlaceholders($menu['add_url']);
             return $this->applyMisJoinInheritance($menu);
         } catch (\Throwable $e) {
@@ -104,8 +108,15 @@ class MenuRouter
 
     /**
      * menu_type='06' (MIS Join) 메뉴: mis_join_pid 메뉴에서 빈 속성 상속.
-     * 상속 대상: table_name / base_filter / g01 / g02 / g03 / g07
+     * 상속 대상: table_name / base_filter / g01 / g02 / g03 / g07 / delete_query
      * 예) 6140 = MisJoin of 631 → 631 의 g03='Y' 상속하여 클라이언트가 recently=OFF 로 시작.
+     *
+     * delete_query 는 2026-08-14 추가 — 누락 시 join 메뉴(예: carparts006112/6165~6168/6197)에서
+     * '삭제' 하면 원본 메뉴(carparts006083, delete_query='useflag=0')의 소프트삭제 규칙을 상속
+     * 못 받고 실제 DELETE FROM 이 나가버림(2026-08-14 실사고 — 상품 430건 소실, 백업복구).
+     * 이 메서드가 채운 값을 프론트가 "삭제내역 조회" 버튼 노출 여부 판단에도 그대로 씀
+     * (MainContent.jsx: menu?.delete_query 존재 시에만 관리자 버튼 노출) — DataHandler::getMenu()의
+     * 동일 상속 로직과 반드시 같이 유지할 것(두 곳에 중복 구현돼있음).
      */
     private function applyMisJoinInheritance(array $menu): array
     {
@@ -115,7 +126,7 @@ class MenuRouter
 
         try {
             $js = $this->pdo->prepare(
-                'SELECT table_name, base_filter, g01, g02, g03, g07
+                'SELECT table_name, base_filter, g01, g02, g03, g07, delete_query, (is_use_print+0) AS is_use_print
                    FROM mis_menus WHERE real_pid = ? LIMIT 1'
             );
             $js->execute([$joinRealPid]);
@@ -124,7 +135,7 @@ class MenuRouter
             return $menu;
         }
 
-        foreach (['table_name', 'base_filter', 'g01', 'g02', 'g03', 'g07'] as $col) {
+        foreach (['table_name', 'base_filter', 'g01', 'g02', 'g03', 'g07', 'delete_query', 'is_use_print'] as $col) {
             $cur = trim((string)($menu[$col] ?? ''));
             $par = trim((string)($parent[$col] ?? ''));
             if ($cur === '' && $par !== '') {
@@ -191,6 +202,7 @@ class MenuRouter
                 WHERE table_m.useflag = '1'
                   AND table_m.idx <> 1
                   AND IFNULL(table_m.g12, '') <> 'Y'
+                  AND IFNULL(table_m.is_menu_hidden, '') <> 'Y'
                   AND (IFNULL(table_m.auth_code, '') <> '02' OR table_member.user_id = ?)
                   AND IFNULL(table_member.authority_level, 0) <> 9
                   -- 상위메뉴가 히든이면 하위도 안 보임

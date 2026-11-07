@@ -188,10 +188,11 @@
 
 /* 폼 내 편집 가능 select 화살표 */
 form select.appearance-none:not([readonly]):not(:disabled) {
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24'%3E%3Cpath fill='%234F6EF7' opacity='0.5' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24'%3E%3Cpath fill='%234F6EF7' opacity='0.8' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
-  background-position: right 6px center;
-  padding-right: 22px;
+  background-position: right 8px center;
+  background-size: 16px 16px;
+  padding-right: 28px;
 }
 
 /* 네이티브 select/option 다크모드 배경 */
@@ -977,7 +978,39 @@ input[type="week"]:hover::-webkit-calendar-picker-indicator {
   table.table-fixed thead th.mis-no-col {
     box-shadow: inset -1px 0 0 var(--color-border), 2px 0 4px -2px rgba(0, 0, 0, 0.12);
   }
+
+  /* ──────────────────────────────────────────────────────────
+     일반 데이터 컬럼 틀고정 ($GLOBALS['_freezeColumns'], 2026-08-28 신설)
+     - 체크/No 컬럼(위) 바로 뒤에 이어붙는 임의 개수의 고정 데이터 컬럼.
+     - 각 셀에 인라인 style="--mis-fz-left:{px}px" 로 누적 offset 을 프론트에서 지정.
+     - 여러 개가 이어지므로 경계선/그림자는 .mis-frozen-col-last (고정영역의 마지막 컬럼)에만.
+     ────────────────────────────────────────────────────────── */
+  table.table-fixed td.mis-frozen-col {
+    position: sticky;
+    left: var(--mis-fz-left, 0px);
+    z-index: 6;
+    background-color: var(--color-surface);
+  }
+  table.table-fixed thead th.mis-frozen-col {
+    position: sticky;
+    left: var(--mis-fz-left, 0px);
+    z-index: 14;
+  }
+  table.table-fixed tr td.mis-frozen-col {
+    z-index: 7;
+  }
+  table.table-fixed tr:hover > td.mis-frozen-col,
+  table.table-fixed tr[class*="bg-surface-2"] > td.mis-frozen-col {
+    background-color: var(--color-surface-2);
+  }
+  table.table-fixed tr[class*="bg-accent-dim"] > td.mis-frozen-col {
+    background-color: var(--color-primary-dim);
+  }
+  table.table-fixed td.mis-frozen-col-last,
+  table.table-fixed thead th.mis-frozen-col-last {
+    box-shadow: inset -1px 0 0 var(--color-border), 2px 0 4px -2px rgba(0, 0, 0, 0.12);
+  }
 }
 
-/* 수정폼 input/textarea 밑줄 가시성 강화 — 기본 .border-accent/30 (액센트 30%) 너무 옅음 → 60%. focus 는 제외해 full-accent 유지 */
+/* 수정폼 input/textarea 밑줄 가시성 강화 — border-b-2 + 60% accent. focus 는 full-accent */
 .border-accent\/30:not(:focus){border-color:color-mix(in srgb,var(--color-primary) 60%,transparent)}

@@ -25,6 +25,58 @@ class DataHandler
     // 동일 요청 내 메모이즈 — file 캐시 환경(APCu 미설치) 에서 syscall 절감
     private array $menuMemo = [];
     private array $fieldsMemo = [];
+    private ?\PDO $originalPdo = null; // dbalias 전환 시 원본 PDO 보관
+
+    /**
+     * 메뉴의 dbalias 에 해당하는 외부 DB PDO 로 전환.
+     * 빈 문자열/default 면 원본 유지. 전환 시 $this->pdo + $GLOBALS['__pdo'] 모두 교체.
+     */
+    private function applyDbalias(array $menu): void
+    {
+        $alias = trim($menu['dbalias'] ?? '');
+        if ($alias === '' || $alias === 'default') return;
+        $aliasPdo = \App\Config\Database::getByAlias($alias);
+        if (!$aliasPdo) return;
+        $this->originalPdo = $this->pdo;
+        $this->pdo = $aliasPdo;
+        $GLOBALS['__pdo'] = $aliasPdo;
+    }
+
+    /** dbalias 전환 후 원본 PDO 복원 */
+    private function restorePdo(): void
+    {
+        if ($this->originalPdo !== null) {
+            $this->pdo = $this->originalPdo;
+            $GLOBALS['__pdo'] = $this->originalPdo;
+            $this->originalPdo = null;
+        }
+    }
+
+    /**
+     * INSERT/UPDATE/DELETE 실행 + 데드락 발생 시 자동 재시도.
+     * 실시간 자동저장처럼 같은 테이블/행에 짧은 간격으로 저장 요청이 몰리는 화면에서
+     * SQL Server 가 한쪽을 "deadlock victim"(SQLSTATE 40001)으로 골라 강제 실패시키는 경우가
+     * 있는데, MS 공식 권장사항대로 그 트랜잭션만 그대로 재시도하면 거의 항상 성공한다.
+     * 데드락이 아닌 다른 에러는 즉시 그대로 던진다(무한정 재시도하면 안 되므로).
+     */
+    private function execWithDeadlockRetry(string $sql, array $binds, int $maxAttempts = 3): \PDOStatement
+    {
+        $attempt = 0;
+        while (true) {
+            $attempt++;
+            try {
+                $stmt = $this->pdo->prepare($sql);
+                $stmt->execute($binds);
+                return $stmt;
+            } catch (\PDOException $e) {
+                $isDeadlock = str_contains($e->getMessage(), '40001')
+                    || stripos($e->getMessage(), 'deadlock') !== false;
+                if (!$isDeadlock || $attempt >= $maxAttempts) throw $e;
+                $this->logger->warning('deadlock — 재시도', ['attempt' => $attempt, 'sql' => substr($sql, 0, 200)]);
+                usleep(random_int(80, 250) * 1000 * $attempt); // 점증 백오프(80~250ms * 시도횟수)
+            }
+        }
+    }
 
     /**
      * dev_mode 표시용 SQL 을 현재 DB 드라이버에 맞춰 변환.
@@ -55,6 +107,15 @@ class DataHandler
         }
 
         $gubun     = (int)($params['gubun']    ?? 0);
+
+        // v7: real_pid → gubun(idx) 자동 변환
+        if ($gubun <= 0 && !empty($params['real_pid'])) {
+            $rpStmt = $this->pdo->prepare('SELECT idx FROM mis_menus WHERE real_pid = ? LIMIT 1');
+            $rpStmt->execute([trim($params['real_pid'])]);
+            $rpRow = $rpStmt->fetch();
+            if ($rpRow) $gubun = (int)$rpRow['idx'];
+        }
+
         $page      = (int)($params['page']     ?? 1);
         $hasExplicitPageSize = isset($params['pageSize']) || isset($params['psize']);
         $pageSize  = (int)($params['pageSize'] ?? $params['psize'] ?? DEFAULT_PAGE_SIZE);
@@ -66,8 +127,8 @@ class DataHandler
         if ($pageSize === 999999) $pageSize = MAX_PAGE_SIZE;
 
         // aggregate: 최근순이 아닐 때만 활성화
-        // 유효 모드: auto, sum, simple.auto, simple.sum
-        $validAggModes = ['auto', 'sum', 'simple.auto', 'simple.sum'];
+        // 유효 모드: auto, sum, simple.auto, simple.sum, total.auto, total.sum
+        $validAggModes = ['auto', 'sum', 'simple.auto', 'simple.sum', 'total.auto', 'total.sum'];
         $aggregateActive = in_array($aggregate, $validAggModes, true) && ($recentlyParam !== 'Y');
         if ($aggregateActive) {
             $page = 1;
@@ -88,7 +149,6 @@ class DataHandler
             return ['success' => false, 'message' => '읽기권한이 없습니다.', '_access' => $access];
         }
         $GLOBALS['_menuAccess'] = $access;
-        if ($access['admin']) $GLOBALS['misSessionIsAdmin'] = 'Y';
 
         $listFlag = ($params['actionFlag'] ?? '') ?: 'list';
         $GLOBALS['_onlyList'] = false;
@@ -100,7 +160,14 @@ class DataHandler
         $GLOBALS['_client_fields'] = null;
         $GLOBALS['_client_redirect'] = null;
         $GLOBALS['_useComments'] = false; // pageLoad 가 '댓글사용여부'(true/Y) 로 켤 수 있음 (워커 재사용 누수 방지 리셋)
+        $GLOBALS['_listCountAlias'] = null; // pageLoad 가 child 필드 alias_name 으로 켤 수 있음(댓글뱃지와 동일 패턴, 2026-08-14 신설)
+        $GLOBALS['_freezeColumns'] = null; // pageLoad 가 틀고정할 필드 alias_name 배열로 켤 수 있음(리스트 컬럼 틀고정, 2026-08-28 신설)
         $this->setGlobals($params, $user, $menu, $listFlag);
+        // setGlobals() 가 misSessionIsAdmin 을 글로벌 admin 여부로만 (재)설정하므로, 메뉴별
+        // authority_level=3 admin 승격은 반드시 그 이후에 적용해야 함 (2026-08-01 버그 수정 —
+        // 기존엔 setGlobals() 호출 전에 있어서 매번 덮어써져 무효화됐음).
+        if ($access['admin']) $GLOBALS['misSessionIsAdmin'] = 'Y';
+        $this->applyDbalias($menu);
         $this->loadProgram($menu['real_pid'] ?? '', $menu);
 
         // 쿼리 빌드 전 초기화 훅
@@ -125,6 +192,7 @@ class DataHandler
         // 읽기전용 조건 — read_only_cond SQL 식을 __readonly 가상 컬럼으로 주입
         $readOnlyCondList = trim($menu['read_only_cond'] ?? '');
         if ($readOnlyCondList !== '') {
+            $readOnlyCondList = $this->resolveSessionPlaceholders($readOnlyCondList, $menu, $user);
             $resolved = $this->resolveExpression($readOnlyCondList, $aliasToTable);
             $selectStr .= ", ({$resolved}) AS __readonly";
         }
@@ -148,7 +216,7 @@ class DataHandler
         }
         // 삭제내역 조회 모드: delete_query (예: "useflag=0") 를 WHERE 조건으로 변환해 기본 use_condition 대체
         if (($params['deleted'] ?? '') === '1') {
-            $delCond = $this->deleteQueryToCondition(trim($menu['delete_query'] ?? ''));
+            $delCond = $this->deleteQueryToCondition(trim($menu['delete_query'] ?? ''), $mainTable);
             if ($delCond !== '') $useCond = $delCond;
         }
         $useCondSql = " AND ({$useCond})";
@@ -162,14 +230,21 @@ class DataHandler
 
         // 마스터-디테일: parent_idx → FK 필드로 자동 필터
         // sort_order 기준 두 번째 필드가 FK (첫 번째가 PK — col_width=-1 숨김이어도 동일)
+        // parent_idx에 '_-_' 구분자가 있으면 2번,3번,... 필드에 각각 매칭 (복합 키)
         $parentIdxRaw = trim($params['parent_idx'] ?? '');
         if ($parentIdxRaw !== '' && count($fields) >= 2) {
             $sorted = $fields;
             usort($sorted, fn($a, $b) => (int)($a['sort_order'] ?? 0) <=> (int)($b['sort_order'] ?? 0));
-            $fkAlias = $sorted[1]['alias_name'] ?? '';
-            if ($fkAlias !== '' && isset($fieldMap[$fkAlias])) {
-                $baseFilterSql .= ' AND ' . $fieldMap[$fkAlias] . ' = ?';
-                $bindings[]     = $parentIdxRaw;  // 항상 문자열 바인딩
+            $parentParts = str_contains($parentIdxRaw, '_-_') ? explode('_-_', $parentIdxRaw) : [$parentIdxRaw];
+            for ($pi = 0; $pi < count($parentParts); $pi++) {
+                $fkField = $sorted[$pi + 1] ?? null; // +1: 첫 번째는 PK
+                if (!$fkField) break;
+                $fkAlias = $fkField['alias_name'] ?? '';
+                if ($fkAlias === '') break;
+                if (isset($fieldMap[$fkAlias])) {
+                    $baseFilterSql .= ' AND ' . $fieldMap[$fkAlias] . ' = ?';
+                    $bindings[]     = trim($parentParts[$pi]);
+                }
             }
         }
 
@@ -206,13 +281,27 @@ class DataHandler
 
         // 캐시 확인
         $recently  = $recentlyParam;
+        // 프로그램 훅이 표준 파라미터 외의 커스텀 GET 값(예: edu001100 의 sel_userid)으로
+        // base_filter/쿼리를 바꾸는 경우, 그 값이 캐시 키에 반영되지 않으면 동일 real_pid+user
+        // 조합에서 서로 다른 대상의 응답이 캐시 충돌로 뒤바뀔 수 있다 — 표준 키 외 나머지를 전부 포함.
+        static $knownListParamKeys = ['gubun','real_pid','idx','act','actionFlag','isMenuIn','isPopup','isPrint','isAddURL',
+            'recently','recently_view','orderby','page','pageSize','psize','allFilter','parent_idx','parent_gubun','tabid',
+            'aggregate','_chart','_chartFull','dev_mode','first_load','deleted','_parentTotal','_backup','_simple','_xlsStream',
+            'customAction','customActionPayload'];
+        $extraParams = [];
+        foreach ($params as $k => $v) {
+            if (in_array($k, $knownListParamKeys, true)) continue;
+            $extraParams[$k] = is_array($v) ? json_encode($v) : (string)$v;
+        }
+        ksort($extraParams);
+        $extraParamsStr = $extraParams ? ('|xp' . md5(json_encode($extraParams))) : '';
         $cacheKey = $this->cache->makeKey(
             $menu['real_pid'] ?? "g{$gubun}",
             (string)($user->uid ?? ''),
             // 스키마버전(|sv) 포함 — 필드/메뉴 설정 변경(col_width 등) 시 schema 버전 bump 되어
             // 이 프로그램을 직접 invalidate 하지 않아도(예: 267 웹소스디테일에서 타 프로그램 필드 편집)
             // list 응답 캐시가 자동 무효화됨.
-            $allFilter . $orderby . $page . $pageSize . $recently . $parentIdxRaw . ($aggregateActive ? '|agg' : '') . '|sv' . $this->cache->schemaVer()
+            $allFilter . $orderby . $page . $pageSize . $recently . $parentIdxRaw . ($aggregateActive ? '|agg' : '') . '|sv' . $this->cache->schemaVer() . $extraParamsStr
         );
 
         // 정렬: recently=Y → PK DESC 강제 / orderby → 사용자 지정 / 기본 정렬
@@ -286,6 +375,7 @@ class DataHandler
                 if (!empty($GLOBALS['_client_buttons'])) $cached['_client_buttons'] = $GLOBALS['_client_buttons'];
                 if (!empty($GLOBALS['_client_saveAndNew'])) $cached['_client_saveAndNew'] = true;
                 if (!empty($GLOBALS['_client_disableSort'])) $cached['_client_disableSort'] = true;
+                if (!empty($GLOBALS['_client_alwaysModify'])) $cached['_client_alwaysModify'] = true;
                 if (!empty($GLOBALS['_client_fieldTitle']) && is_array($GLOBALS['_client_fieldTitle'])) {
                     foreach ($cached['fields'] as &$_f) {
                         $alias = $_f['alias_name'] ?? '';
@@ -302,6 +392,7 @@ class DataHandler
                 // 캐시된 _access 는 과거 상태일 수 있으므로 현재 요청에서 새로 계산한 값으로 덮어쓰기
                 $cached['_access'] = $access;
                 $this->_attachCommentData($cached, $menu); // 댓글 사용 시 행별 갯수(__commentCount) 주입 (캐시 후 매요청 신선)
+                $this->_attachListCountData($cached, $menu); // _listCountAlias 사용 시 행별 갯수(__listCount) 주입 (캐시 후 매요청 신선)
                 return $cached;
             }
         }
@@ -313,6 +404,11 @@ class DataHandler
         // v6 의 빠른 xls 다운로드 방식과 동일 — fetchAll 메모리 한도/PHP-FPM 타임아웃 회피.
         if (($params['_xlsStream'] ?? '') === '1') {
             $this->callHook('list_json_init'); // 사용자 SQL 변형/사이드이펙트는 계속 적용
+            try {
+                $now = $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME) === 'sqlsrv' ? 'GETDATE()' : 'NOW()';
+                $this->pdo->prepare("INSERT INTO mis_activity_logs (log_type, menu_idx, query, ip, http_referer, http_user_agent, useflag, wdate, wdater) VALUES (?,?,?,?,?,?,?,$now,?)")
+                    ->execute(['08', (int)($params['gubun'] ?? 0), 'xlsStream', $_SERVER['REMOTE_ADDR'] ?? '', '', $_SERVER['HTTP_USER_AGENT'] ?? '', '1', $GLOBALS['misSessionUserId'] ?? '']);
+            } catch (\Throwable) {}
             $this->streamXlsRows($selectSql, $orderSql, $bindings, $fields, $menu, $mainTable, $whereFull);
             exit;
         }
@@ -324,6 +420,14 @@ class DataHandler
         $GLOBALS['_client_openTab']  = null;
         $GLOBALS['_client_confirm']  = null;
         // _client_redirect 는 pageLoad() 에서 설정 가능 (리다이렉트 전용 프로그램) → 리셋하지 않음
+        // 엑셀 다운로드 로깅
+        if (($params['_excel'] ?? '') === '1') {
+            try {
+                $now = $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME) === 'sqlsrv' ? 'GETDATE()' : 'NOW()';
+                $this->pdo->prepare("INSERT INTO mis_activity_logs (log_type, menu_idx, query, ip, http_referer, http_user_agent, useflag, wdate, wdater) VALUES (?,?,?,?,?,?,?,$now,?)")
+                    ->execute(['08', (int)($params['gubun'] ?? 0), 'excel download', $_SERVER['REMOTE_ADDR'] ?? '', '', $_SERVER['HTTP_USER_AGENT'] ?? '', '1', $GLOBALS['misSessionUserId'] ?? '']);
+            } catch (\Throwable) {}
+        }
         $this->callHook('list_json_init');
 
         $total = 0;
@@ -443,12 +547,17 @@ class DataHandler
             '_access'  => $access,
         ];
 
-        $this->cache->set($cacheKey, $result);
+        $this->cache->set($cacheKey, $result, CACHE_TTL, $menu['real_pid'] ?? "g{$gubun}");
 
         // _simple 모드: 행단위 훅(list_json_load) / row_buttons / aggregate / __html 모두 건너뛰고
         // raw 데이터 즉시 반환. fast xls 다운로드 전용 — 클라이언트가 raw 값으로 HTML 테이블 빌드.
         // before_query / list_query / list_json_init 같은 쿼리빌드 훅은 이미 적용된 상태.
         if (($params['_simple'] ?? '') === '1') {
+            try {
+                $now = $this->pdo->getAttribute(\PDO::ATTR_DRIVER_NAME) === 'sqlsrv' ? 'GETDATE()' : 'NOW()';
+                $this->pdo->prepare("INSERT INTO mis_activity_logs (log_type, menu_idx, query, ip, http_referer, http_user_agent, useflag, wdate, wdater) VALUES (?,?,?,?,?,?,?,$now,?)")
+                    ->execute(['08', (int)($params['gubun'] ?? 0), 'xlsSimple', $_SERVER['REMOTE_ADDR'] ?? '', '', $_SERVER['HTTP_USER_AGENT'] ?? '', '1', $GLOBALS['misSessionUserId'] ?? '']);
+            } catch (\Throwable) {}
             return $result;
         }
 
@@ -546,6 +655,8 @@ class DataHandler
             $result['_count_sql'] = $displayCountSql;
             $result['_bindings']  = $bindings;
             if ($sqlError !== null) $result['_sql_error'] = $sqlError;
+            $da = trim($menu['dbalias'] ?? '');
+            if ($da !== '' && $da !== 'default') $result['_dbalias'] = $da;
         }
 
         if (!empty($GLOBALS['_execSql_log']) && ($params['dev_mode'] ?? '') === '1') {
@@ -553,6 +664,11 @@ class DataHandler
         }
 
         $this->_attachCommentData($result, $menu); // 댓글 사용 시 행별 갯수(__commentCount) 주입
+        $this->_attachListCountData($result, $menu); // _listCountAlias 사용 시 행별 갯수(__listCount) 주입
+        // _freezeColumns 사용 시(pageLoad 가 alias_name 배열로 지정) 응답에 그대로 실어 프론트가 틀고정 렌더링
+        if (!empty($GLOBALS['_freezeColumns']) && is_array($GLOBALS['_freezeColumns'])) {
+            $result['_freezeColumns'] = array_values($GLOBALS['_freezeColumns']);
+        }
         return $result;
     }
 
@@ -625,15 +741,18 @@ class DataHandler
             return ['success' => false, 'message' => 'gubun, alias 필수'];
         }
 
-        // items 값 조회
+        // items 값 조회 — MIS Join(menu_type='06') 이면 부모(mis_join_pid) 필드에서 조회
+        $menu = $this->getMenu($gubun);
+        $fieldRealPid = trim($menu['_fields_real_pid'] ?? '') ?: trim($menu['real_pid'] ?? '');
         $stmt = $this->pdo->prepare(
-            'SELECT f.items, f.grid_ctl_name, f.schema_type, f.db_field, m.table_name
+            'SELECT f.items, f.grid_ctl_name, f.schema_type, f.db_field,
+                    COALESCE(NULLIF(m.table_name,\'\'), (SELECT table_name FROM mis_menus WHERE real_pid = m.mis_join_pid LIMIT 1)) AS table_name
                FROM mis_menu_fields f
                JOIN mis_menus m ON m.real_pid = f.real_pid
-              WHERE m.idx = ? AND f.alias_name = ? AND f.useflag = \'1\'
+              WHERE f.real_pid = ? AND f.alias_name = ? AND f.useflag = \'1\'
               LIMIT 1'
         );
-        $stmt->execute([$gubun, $alias]);
+        $stmt->execute([$fieldRealPid, $alias]);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
         if (!$row) return ['success' => true, 'data' => []];
 
@@ -664,10 +783,14 @@ class DataHandler
             try {
                 $stmt2 = $this->pdo->query($itemsSql);
                 $rows  = $stmt2->fetchAll(\PDO::FETCH_ASSOC);
-                $data  = array_map(fn($r) => [
-                    'value' => (string)($r['value'] ?? ''),
-                    'text'  => (string)($r['text']  ?? $r['value'] ?? ''),
-                ], $rows);
+                $data  = array_map(function($r) {
+                    $item = [
+                        'value' => (string)($r['value'] ?? ''),
+                        'text'  => (string)($r['text']  ?? $r['value'] ?? ''),
+                    ];
+                    if (isset($r['group_item'])) $item['group'] = (string)$r['group_item'];
+                    return $item;
+                }, $rows);
                 return ['success' => true, 'data' => $data];
             } catch (\Throwable $e) {
                 return ['success' => false, 'message' => $e->getMessage(), '_sql' => $itemsSql];
@@ -721,8 +844,48 @@ class DataHandler
         $baseFilter    = $this->resolveBaseFilter($baseFilter, $aliasToTable);
         $baseFilterSql = $baseFilter !== '' ? " AND ({$baseFilter})" : '';
 
-        $useCond    = trim($menu['use_condition'] ?? '');
-        $useCond    = $useCond !== '' ? $useCond : "table_m.useflag = '1'";
+        // 마스터-디테일: parent_idx → FK 필드로 자동 필터 (list()와 동일 컨벤션 — PK 다음
+        // sort_order 필드가 FK). 이게 없어서 자식그리드(예: 267 웹소스 디테일)의 자동완성이
+        // 전체 테이블을 스캔해 느렸던 문제(2026-08-07, 부자톡에서 발견) 수정.
+        $parentIdxRaw   = trim($params['parent_idx'] ?? '');
+        // 프론트가 parent_idx 를 안 보내는 경우(구버전 캐시된 JS 등) 대비 폴백 — Referer(현재 열려있는
+        // 부모 화면의 URL)에서 idx 를 직접 유추. 브라우저 캐시 상태와 무관하게 항상 동작하도록.
+        // 실패해도 안전(그냥 원래처럼 스코핑 없이 느려질 뿐, 에러/오작동 없음).
+        if ($parentIdxRaw === '') {
+            $refQuery = parse_url((string)($_SERVER['HTTP_REFERER'] ?? ''), PHP_URL_QUERY) ?: '';
+            parse_str($refQuery, $refParams);
+            $parentIdxRaw = trim((string)($refParams['idx'] ?? ''));
+        }
+        $parentBindings = [];
+        if ($parentIdxRaw !== '' && count($fields) >= 2) {
+            $sorted = $fields;
+            usort($sorted, fn($a, $b) => (int)($a['sort_order'] ?? 0) <=> (int)($b['sort_order'] ?? 0));
+            $parentParts = str_contains($parentIdxRaw, '_-_') ? explode('_-_', $parentIdxRaw) : [$parentIdxRaw];
+            for ($pi = 0; $pi < count($parentParts); $pi++) {
+                $fkField = $sorted[$pi + 1] ?? null; // +1: 첫 번째는 PK
+                if (!$fkField) break;
+                $fkAlias = $fkField['alias_name'] ?? '';
+                if ($fkAlias === '') break;
+                if (isset($fieldMap[$fkAlias])) {
+                    $baseFilterSql .= ' AND ' . $fieldMap[$fkAlias] . ' = ?';
+                    $parentBindings[] = trim($parentParts[$pi]);
+                }
+            }
+        }
+
+        // use_condition: 레코드 표시 조건 (list 쿼리 빌드와 동일 규칙 — v6 컬럼명(delchk 등) 해석 포함)
+        $useCond = trim($menu['use_condition'] ?? '');
+        $isPlaceholder = preg_match('/^\s*(\d+)\s*=\s*\1\s*$/', $useCond) === 1;
+        if ($useCond !== '' && !$isPlaceholder) {
+            $useCond = $this->resolveExpression($useCond, $aliasToTable);
+        } else {
+            try {
+                $cols = $mainTable !== '' ? $this->getTableColumnSet($mainTable) : [];
+                $useCond = isset($cols['useflag']) ? "table_m.useflag = '1'" : '1=1';
+            } catch (\Throwable) {
+                $useCond = '1=1';
+            }
+        }
         $useCondSql = " AND ({$useCond})";
 
         // 시간 관련 필터(월도/일자/일시 등)는 최근값이 위로 오도록 내림차순.
@@ -739,19 +902,82 @@ class DataHandler
                     || preg_match('/월도|년월|연월|일자|일시|날짜/u', $colTitleV);
         $orderDir = $isTimeField ? ' DESC' : '';
 
+        // 검색어(q) — 클라이언트 SearchableSelect/자동완성 이 입력할 때마다 서버에 실시간 검색 요청.
+        // distinct 값이 LIMIT(300) 보다 많은 필드(예: 성명 4000+건)에서 앞쪽 300건에 없는 값은
+        // 검색이 안 되던 문제(2026-08-01) 대응 — q 가 있으면 LIKE 조건으로 서버에서 직접 필터링.
+        $q = trim((string)($params['q'] ?? ''));
+        $bindings = $parentBindings;
+
+        // 상단/컬럼헤더 필터(allFilter) 로 자동완성 후보를 스코핑 (2026-08-08 추가).
+        // 예: 그리드가 '번개장터=판매종료' 로 필터링된 상태면, it_name 자동완성도 그 5건 안에서만
+        // 후보를 보여준다 — 필터링 대상 필드 자신은 제외(자기참조 방지: 아직 커밋 안 된 콤보박스
+        // 부분입력이 allFilter 에 남아있는 경우가 있어도 스스로를 걸러내지 않도록).
+        $callerAllFilterRaw = trim((string)($params['allFilter'] ?? ''));
+        if ($callerAllFilterRaw !== '' && $callerAllFilterRaw !== '[]') {
+            $afArr = json_decode($callerAllFilterRaw, true);
+            $afArr = is_array($afArr) ? $afArr : [];
+            $afArr = array_values(array_filter($afArr, function ($f) use ($field) {
+                $rawField = (string)($f['field'] ?? '');
+                if (str_starts_with($rawField, 'toolbar_')) $rawField = substr($rawField, 8);
+                return $rawField !== $field;
+            }));
+            if (!empty($afArr)) {
+                $afWhere = $this->qb->buildWhere($afArr, '', $fieldMap);
+                if ($afWhere['sql'] !== '') {
+                    // buildWhere() 는 "WHERE ..." 형태 — filterItems 는 이미 WHERE 1=1 로 시작하므로 AND 로 이어붙임
+                    $baseFilterSql .= ' AND (' . substr($afWhere['sql'], 6) . ')';
+                    $bindings = array_merge($bindings, $afWhere['bindings']);
+                }
+            }
+        }
+
+        $fetchValues = function (string $sql, array $bind) {
+            $stmt = $this->pdo->prepare($sql);
+            $stmt->execute($bind);
+            return array_values(array_filter(
+                array_column($stmt->fetchAll(\PDO::FETCH_ASSOC), 'v'),
+                fn($v) => $v !== null && $v !== ''
+            ));
+        };
+
+        // q 매치 결과만 보여주면 다른 값으로 못 넘어가 답답하다는 요청(2026-08-03) — 매치된 값을
+        // 상단에 두고, 그 아래에 기본(비검색) 목록도 이어서 채워서 계속 둘러볼 수 있게 한다.
+        if ($q !== '') {
+            // ESCAPE 문자로 backslash 대신 '!' 사용 — MySQL 문자열 리터럴의 backslash 이스케이프와
+            // MSSQL(T-SQL, backslash 특수 의미 없음·ESCAPE 인자는 정확히 1글자 요구) 방언 차이를
+            // 신경 쓸 필요 없이 양쪽에서 동일하게 동작.
+            $esc = str_replace(['!', '%', '_'], ['!!', '!%', '!_'], $q);
+            $searchSql = " AND ({$fieldExpr} LIKE ? ESCAPE '!')";
+
+            $matchSql = "SELECT DISTINCT {$fieldExpr} AS v"
+                      . " FROM `{$mainTable}` table_m{$joinStr}"
+                      . " WHERE 1=1{$useCondSql}{$baseFilterSql}{$searchSql}"
+                      . " ORDER BY v{$orderDir} LIMIT 300";
+            $restSql = "SELECT DISTINCT {$fieldExpr} AS v"
+                     . " FROM `{$mainTable}` table_m{$joinStr}"
+                     . " WHERE 1=1{$useCondSql}{$baseFilterSql}"
+                     . " ORDER BY v{$orderDir} LIMIT 300";
+
+            try {
+                $matched = $fetchValues($matchSql, [...$bindings, "%{$esc}%"]);
+                $rest    = $fetchValues($restSql, $bindings);
+
+                $matchedSet = array_flip(array_map('strval', $matched));
+                $rest = array_values(array_filter($rest, fn($v) => !isset($matchedSet[(string)$v])));
+
+                return ['success' => true, 'data' => array_slice(array_merge($matched, $rest), 0, 300)];
+            } catch (\Throwable $e) {
+                return ['success' => true, 'data' => []];
+            }
+        }
+
         $sql = "SELECT DISTINCT {$fieldExpr} AS v"
              . " FROM `{$mainTable}` table_m{$joinStr}"
              . " WHERE 1=1{$useCondSql}{$baseFilterSql}"
              . " ORDER BY v{$orderDir} LIMIT 300";
 
         try {
-            $stmt = $this->pdo->prepare($sql);
-            $stmt->execute([]);
-            $items = array_filter(
-                array_column($stmt->fetchAll(\PDO::FETCH_ASSOC), 'v'),
-                fn($v) => $v !== null && $v !== ''
-            );
-            return ['success' => true, 'data' => array_values($items)];
+            return ['success' => true, 'data' => $fetchValues($sql, $bindings)];
         } catch (\Throwable $e) {
             return ['success' => true, 'data' => []];
         }
@@ -1012,10 +1238,14 @@ class DataHandler
             return ['success' => false, 'data' => null, 'message' => '수정권한이 없습니다.', '_access' => $accessV];
         }
         $GLOBALS['_menuAccess'] = $accessV;
-        if ($accessV['admin']) $GLOBALS['misSessionIsAdmin'] = 'Y';
 
         $GLOBALS['_useComments'] = false; // pageLoad 가 '댓글사용여부' 로 켤 수 있음 (워커 재사용 누수 방지 리셋)
+        $GLOBALS['_listCountAlias'] = null; // list() 전용 플래그지만 워커 재사용 누수 방지 차원에서 여기도 리셋
+        $GLOBALS['_freezeColumns'] = null; // list() 전용 플래그지만 워커 재사용 누수 방지 차원에서 여기도 리셋
         $this->setGlobals($params, $user, $menu, $actionFlag);
+        // setGlobals() 이후에 적용해야 덮어써지지 않음 (2026-08-01 버그 수정, list() 참고)
+        if ($accessV['admin']) $GLOBALS['misSessionIsAdmin'] = 'Y';
+        $this->applyDbalias($menu);
         $this->loadProgram($menu['real_pid'] ?? '', $menu);
 
         // 쿼리 빌드 전 초기화 훅
@@ -1036,6 +1266,7 @@ class DataHandler
         // 읽기전용 조건 — view 에도 __readonly 가상 컬럼 포함
         $readOnlyCondV = trim($menu['read_only_cond'] ?? '');
         if ($readOnlyCondV !== '') {
+            $readOnlyCondV = $this->resolveSessionPlaceholders($readOnlyCondV, $menu, $user);
             $resolvedV = $this->resolveExpression($readOnlyCondV, $aliasToTable);
             $selectStr .= ", ({$resolvedV}) AS __readonly";
         }
@@ -1048,21 +1279,26 @@ class DataHandler
         $pkCw      = (int)($pkField['col_width'] ?? 0);
 
         if ($pkCw === -1 || $pkCw === -2) {
-            // PK 숨김 → URL idx 는 첫 번째 visible 필드값 → 그 필드로 조회.
-            // col_width=0 (그리드 숨김/폼 표시) 도 lookup 후보 — PK 숨김 마커(-1, -2) 만 skip.
+            // PK 숨김 → URL idx 는 첫 번째 linkVal 후보 필드값 → 그 필드로 조회.
+            // col_width=-2 는 linkVal 후보 (마스터-디테일 연결 키 등), -1 만 skip.
             $firstVisible = null;
             foreach ($sortedFields as $f) {
                 $w = (int)($f['col_width'] ?? 0);
-                if ($w !== -1 && $w !== -2) { $firstVisible = $f; break; }
+                if ($w !== -1) { $firstVisible = $f; break; }
             }
             if (!$firstVisible) {
                 return ['success' => false, 'data' => null, 'message' => '잘못된 요청입니다.'];
             }
             $fvAlias   = $firstVisible['db_table'] ?? 'table_m';
             $fvDbField = $firstVisible['db_field']  ?? '';
-            $v7t       = $aliasToTable[$fvAlias] ?? $table;
-            $fvCol     = $this->resolveColumn($v7t, $fvDbField);
-            $whereClause = "`{$fvAlias}`.`{$fvCol}` = ?";
+            if ($fvAlias === '' || preg_match('/[\s(\'"]/', $fvDbField)) {
+                // 수식 필드 (db_table 비어있거나 db_field에 공백/괄호 포함) → 수식 그대로 WHERE
+                $whereClause = "({$fvDbField}) = ?";
+            } else {
+                $v7t       = $aliasToTable[$fvAlias] ?? $table;
+                $fvCol     = $this->resolveColumn($v7t, $fvDbField);
+                $whereClause = "`{$fvAlias}`.`{$fvCol}` = ?";
+            }
             $whereValue  = $idxParam;
         } else {
             // 일반: fields[0] 의 db_field 를 실제 컬럼명으로 해석해 WHERE 생성
@@ -1118,13 +1354,22 @@ class DataHandler
 
         // 인쇄양식: is_use_print=1 이고 템플릿 파일이 있으면 렌더링
         $printHtml = null;
-        if (($menu['is_use_print'] ?? '') == '1' && $row) {
+        if (!empty($menu['is_use_print']) && $row) {
             $printFile = PROGRAMS_PATH . '/' . ($menu['real_pid'] ?? '') . '_print.html';
+            // MIS Join: 자체 파일 없으면 mis_join_pid 의 인쇄양식 fallback
+            if (!file_exists($printFile) && !empty($menu['mis_join_pid'])) {
+                $printFile = PROGRAMS_PATH . '/' . trim($menu['mis_join_pid']) . '_print.html';
+            }
             if (file_exists($printFile)) {
                 try {
                     $tplContent = file_get_contents($printFile);
                     $renderer = new \App\PrintRenderer($this->pdo);
-                    $printHtml = $renderer->render($tplContent, $row, $fields, $row['idx'] ?? 0);
+                    // parentIdx: PK 숨김(-1)일 때는 linkVal(2번 필드 값)을 사용 — child 연결 키
+                    $printParentIdx = $row['idx'] ?? 0;
+                    if ($pkCw === -1 || $pkCw === -2) {
+                        $printParentIdx = $row[$firstVisible['alias_name'] ?? ''] ?? $row['idx'] ?? 0;
+                    }
+                    $printHtml = $renderer->render($tplContent, $row, $fields, $printParentIdx, $actionFlag);
                 } catch (\Throwable $e) {
                     $printHtml = '<p style="color:red">인쇄양식 오류: ' . htmlspecialchars($e->getMessage()) . '</p>';
                 }
@@ -1192,6 +1437,17 @@ class DataHandler
         // row_buttons 훅 — view 폼 필드 라벨 옆에 버튼 주입 (list 셀과 공유)
         $fieldButtons = self::_renderRowButtons($row ?: []);
 
+        // 필드 속성 동적 변경 (view_load 에서 설정한 _client_fields 적용)
+        if (!empty($GLOBALS['_client_fields']) && is_array($GLOBALS['_client_fields'])) {
+            foreach ($fields as &$_f) {
+                $alias = $_f['alias_name'] ?? '';
+                if (isset($GLOBALS['_client_fields'][$alias])) {
+                    $_f = array_merge($_f, $GLOBALS['_client_fields'][$alias]);
+                }
+            }
+            unset($_f);
+        }
+
         // fields 도 함께 반환 — DataForm 이 별도 act=list 호출(pageSize=1) 없이도 폼을 그릴 수 있게.
         $viewResult = ['success' => true, 'data' => $row ?: null, 'fields' => $fields, 'template' => $template, 'printHtml' => $printHtml, '_access' => $accessV];
         if (!empty($fieldButtons)) $viewResult['_field_buttons'] = $fieldButtons;
@@ -1209,6 +1465,8 @@ class DataHandler
         if (!empty($GLOBALS['_client_formButtons'])) $viewResult['_client_formButtons'] = $GLOBALS['_client_formButtons'];
         if (!empty($GLOBALS['_client_saveAndNew'])) $viewResult['_client_saveAndNew'] = true;
         if (!empty($GLOBALS['_client_belowForm'])) $viewResult['_client_belowForm'] = $GLOBALS['_client_belowForm'];
+        if ($GLOBALS['_client_js'] !== null) $viewResult['_client_js'] = $GLOBALS['_client_js'];
+        if ($GLOBALS['_client_css'] !== null) $viewResult['_client_css'] = $GLOBALS['_client_css'];
         if (!empty($GLOBALS['_useComments'])) {        // 댓글 사용 → DataForm 이 마지막 '댓글' 탭 표시
             $cRealPid = $this->_resolveCommentRealPid($menu);
             $viewResult['_useComments']    = true;
@@ -1243,6 +1501,8 @@ class DataHandler
             }
             $viewResult['_bindings'] = [$whereValue];
             if ($viewSqlError !== null) $viewResult['_sql_error'] = $viewSqlError;
+            $da = trim($menu['dbalias'] ?? '');
+            if ($da !== '' && $da !== 'default') $viewResult['_dbalias'] = $da;
         }
         if (!empty($GLOBALS['_execSql_log']) && ($params['dev_mode'] ?? '') === '1') {
             $viewResult['_execSql'] = $GLOBALS['_execSql_log'];
@@ -1269,7 +1529,10 @@ class DataHandler
             return ['success' => false, 'message' => '저장/수정 권한이 없습니다.', '_access' => $accessS];
         }
         $GLOBALS['_menuAccess'] = $accessS;
-        if ($accessS['admin']) $GLOBALS['misSessionIsAdmin'] = 'Y';
+
+        // dbalias 전환 — 아래 PK 조회(숨김PK→visible key lookup)부터 이미 대상 테이블(다른 DB일 수 있음)에
+        // 쿼리를 날리므로, 메뉴/권한 메타데이터 조회(기본 DB)가 끝난 직후 여기서 전환해야 함.
+        $this->applyDbalias($menu);
 
         // sort_order=1 필드 → PK 컬럼 결정 (WHERE 조건)
         usort($fields, fn($a, $b) => (int)($a['sort_order'] ?? 0) <=> (int)($b['sort_order'] ?? 0));
@@ -1292,10 +1555,24 @@ class DataHandler
                 if ($table) {
                     $visibleKey = $fields[1]['alias_name'] ?? '';
                     $visibleDbField = trim($fields[1]['db_field'] ?? '');
-                    $visibleCol = $visibleDbField ? $this->resolveColumn($table, $visibleDbField) : '';
+                    // db_field가 원본 SQL 표현식(concat() 등)이면 컬럼명이 아니므로 백틱으로 감싸면
+                    // 안 됨 — resolveColumn()은 단순 컬럼명 매핑용이라 표현식을 그대로 반환하는데,
+                    // 그걸 `{...}`로 감싸면 MySQL이 전체 문자열을 하나의 (존재하지 않는) 컬럼명으로
+                    // 해석해 "Unknown column" 오류가 난다(2026-09-17, carparts006116 — 숨김PK 다음
+                    // 필드가 concat(car_code,'_-_',cate_code) 표현식인 경우 실제 발생·사용자 발견).
+                    // view(조회) 경로는 이미 이 표현식을 원본 SQL 그대로 사용해 정상 동작하므로 동일하게 맞춤.
+                    $isExprField = $visibleDbField !== '' && preg_match('/[\s(\'"]/', $visibleDbField);
+                    $visibleCol = $isExprField
+                        ? $visibleDbField
+                        : ($visibleDbField ? $this->resolveColumn($table, $visibleDbField) : '');
                     if ($visibleCol !== '') {
                         $lookupPkCol = $this->resolveColumn($table, $pkDbField ?: 'idx');
-                        $lookStmt = $this->pdo->prepare("SELECT `{$lookupPkCol}` FROM `{$table}` WHERE `{$visibleCol}` = ? LIMIT 1");
+                        $whereExpr = $isExprField ? "({$visibleCol})" : "`{$visibleCol}`";
+                        // 표현식(concat 등)은 mis_menu_fields 관례상 항상 table_m.col 형태로 저장돼
+                        // 있으므로(예: concat(table_m.car_code,...)), FROM 절에 table_m 별칭을 줘야
+                        // 그 표현식이 참조하는 컬럼을 찾을 수 있다(2026-09-17, 사용자 재보고로 발견 —
+                        // 별칭 없이 실제 테이블명만 쓰다 "Unknown column 'table_m.car_code'" 발생).
+                        $lookStmt = $this->pdo->prepare("SELECT `{$lookupPkCol}` FROM `{$table}` table_m WHERE {$whereExpr} = ? LIMIT 1");
                         $lookStmt->execute([$idxRaw]);
                         $foundPk = $lookStmt->fetchColumn();
                         if ($foundPk !== false) {
@@ -1312,7 +1589,7 @@ class DataHandler
         // read_only_cond 체크 — 수정 대상 행이 읽기전용이면 차단.
         // 단, max_length 가 ! 로 끝나는 필드(override) 가 하나라도 있으면 그 필드만 갱신 허용.
         // (첨부/이미지는 ! 가 multi-attach 의미라 override 대상 아님)
-        $rowIsReadOnly = $isUpdate && $this->isRowReadOnly($menu, (int)$idx, $pkCol);
+        $rowIsReadOnly = $isUpdate && $this->isRowReadOnly($menu, (int)$idx, $pkCol, $user);
         if ($rowIsReadOnly) {
             $hasOverride = false;
             foreach ($fields as $f) {
@@ -1334,6 +1611,8 @@ class DataHandler
             ? array_keys(array_diff_key($body, array_flip(['_listEdit','_confirmed','idx','gubun','act','_csrf'])))
             : [];
         $this->setGlobals($params, $user, $menu, $isUpdate ? 'modify' : 'write');
+        // setGlobals() 이후에 적용해야 덮어써지지 않음 (2026-08-01 버그 수정, list() 참고)
+        if ($accessS['admin']) $GLOBALS['misSessionIsAdmin'] = 'Y';
         $this->loadProgram($menu['real_pid'] ?? '', $menu);
 
         // 쿼리 빌드 전 초기화 훅
@@ -1367,6 +1646,15 @@ class DataHandler
         $updateList = $saveList;
         $afterScript = '';
 
+        // v6 호환: global $updateList/$saveList/$initList/$viewList 로 접근하는 훅 지원
+        $GLOBALS['saveList']   = &$saveList;
+        $GLOBALS['updateList'] = &$updateList;
+        $GLOBALS['afterScript'] = &$afterScript;
+        // 원본 요청 body 그대로 노출 — db_table='virtual_field' 필드는 filterData()가
+        // table_m 이 아니라는 이유로 $updateList 에서 아예 제외하므로(위 filterData 참고),
+        // 그런 가상필드 값을 훅에서 읽어야 할 때(예: 비밀번호변경) 이걸로 접근한다.
+        $GLOBALS['_requestBody'] = $body;
+
         // rowReadOnly 행: override(! suffix) 컬럼만 갱신 허용
         if ($rowIsReadOnly) {
             $overrideCols = [];
@@ -1390,6 +1678,11 @@ class DataHandler
             }
         }
 
+        // v6 호환: save 훅에서 사용하는 전역변수 (save_updateReady 훅 안에서도 global $key_value 로
+        // 접근 가능해야 하므로 callHook 호출 이전에 세팅 — 2026-08-01 버그 수정)
+        $GLOBALS['key_value']  = $pkVal;
+        $GLOBALS['upload_idx'] = $pkVal;
+
         $GLOBALS['_client_confirm'] = null;
         $this->callHook('save_updateReady', $saveList);
 
@@ -1405,14 +1698,42 @@ class DataHandler
         if ($isUpdate) {
             $this->callHook('save_updateBefore', $updateList);
             [$sql, $binds] = $this->buildUpdate($table, $updateList, $pkCol, $pkVal, $encCols, $pwdKey);
+            $origSql = $sql;
+            // v6 호환: global $sql로 접근하는 훅 지원
+            $GLOBALS['sql'] = $sql;
             $this->callHook('save_updateQueryBefore', $sql, $binds);
-            $this->pdo->prepare($sql)->execute($binds);
+            // 훅이 global $sql을 변경했을 수 있으므로 동기화
+            $hookSql = $GLOBALS['sql'];
+            if ($hookSql !== $origSql && $hookSql !== $sql) $sql = $hookSql;
+            // 원래 UPDATE 실행 (바인딩 포함) — 데드락이면 자동 재시도
+            $this->execWithDeadlockRetry($origSql, $binds);
+            // 훅이 추가한 SQL 별도 실행
+            $appended = trim(substr($sql, strlen($origSql)));
+            if ($appended !== '') {
+                try { $this->pdo->exec($appended); } catch (\Throwable $e) {
+                    $this->logger->warning('save_updateQueryBefore appended SQL failed', ['err' => $e->getMessage()]);
+                }
+            }
         } else {
             $this->callHook('save_writeBefore', $updateList);
+            // ── 뷰 레이아웃 기본값 자동 채움 (mis_menu_fields INSERT 시) ──
+            // grid_view_xl/lg/md/sm/hight 가 비어있으면 grid_ctl_name·max_length 기반 통계값 적용
+            $this->applyFieldLayoutDefaults($table, $updateList);
             [$sql, $binds] = $this->buildInsert($table, $updateList, $encCols, $pwdKey);
             $this->callHook('save_writeQueryBefore', $sql, $binds);
-            $this->pdo->prepare($sql)->execute($binds);
-            $idx = (int)$this->pdo->lastInsertId();
+            // 데드락이면 자동 재시도
+            $this->execWithDeadlockRetry($sql, $binds);
+            // pk 컬럼값을 훅(save_writeBefore 등)에서 이미 명시적으로 채운 경우(예: 커스텀
+            // 채번 로직으로 AUTO_INCREMENT 컬럼에 직접 값을 INSERT) MySQL/MariaDB는
+            // LAST_INSERT_ID()를 그 값으로 갱신하지 않는다(직전 세션값 그대로 유지되거나 0).
+            // 이 경우 lastInsertId() 대신 실제 INSERT된 pk값을 그대로 사용해야 한다.
+            // pk를 안 채운 일반적인 케이스(대다수 테이블)는 기존과 동일하게 lastInsertId() 사용.
+            // 2026-08-13 추가 — g5_shop_item.it_id 커스텀 채번(carparts006083) 지원 목적.
+            if ($pkCol !== '' && isset($updateList[$pkCol]) && $updateList[$pkCol] !== '' && $updateList[$pkCol] !== null) {
+                $idx = (int)$updateList[$pkCol];
+            } else {
+                $idx = (int)$this->pdo->lastInsertId();
+            }
             $GLOBALS['newIdx'] = $idx;
         }
 
@@ -1454,6 +1775,31 @@ class DataHandler
                     if ($pkCol !== '' && $pkCol !== 'idx') {
                         $allVals[$pkCol] = $idx;
                     }
+                    // 템플릿에 쓰인 토큰 중 $allVals 에 없는 것(예: concat() 계산식 같은 가상 컬럼
+                    // qq_idx)은 body/updateList 어디에도 값이 없어 리터럴 "{qq_idx}"로 그대로
+                    // 남던 버그(2026-09-17, carparts006116에서 발견) — 방금 저장된 행을 실제로
+                    // SELECT 해서 채운다. 표현식 필드는 백틱으로 감싸면 안 되므로(위 숨김PK
+                    // 룩업과 동일 이유) 원본 그대로 사용.
+                    preg_match_all('/\{(\w+)\}/', $defaultVal, $tokenMatches);
+                    $missingTokens = array_diff(array_unique($tokenMatches[1] ?? []), array_keys($allVals));
+                    foreach ($missingTokens as $tok) {
+                        foreach ($fields as $tf) {
+                            if (trim($tf['alias_name'] ?? '') !== $tok) continue;
+                            $tfDbField = trim($tf['db_field'] ?? '');
+                            if ($tfDbField === '') break;
+                            $isExprTok = (bool)preg_match('/[\s(\'"]/', $tfDbField);
+                            $tokCol = $isExprTok ? $tfDbField : $this->resolveColumn($table, $tfDbField);
+                            if ($tokCol === '') break;
+                            try {
+                                $selExprTok = $isExprTok ? "({$tokCol})" : "`{$tokCol}`";
+                                $tvs = $this->pdo->prepare("SELECT {$selExprTok} FROM `{$table}` table_m WHERE `{$pkCol}` = ? LIMIT 1");
+                                $tvs->execute([$idx]);
+                                $tv = $tvs->fetchColumn();
+                                if ($tv !== false && $tv !== null) $allVals[$tok] = $tv;
+                            } catch (\Throwable) { /* 토큰은 리터럴로 남김(기존 동작 유지) */ }
+                            break;
+                        }
+                    }
                     $customPath = preg_replace_callback('/\{(\w+)\}/', function ($m) use ($allVals) {
                         return $allVals[$m[1]] ?? $m[0];
                     }, $defaultVal);
@@ -1488,11 +1834,19 @@ class DataHandler
         if ($pk0cw === -1 || $pk0cw === -2) {
             $visibleAlias   = $fields[1]['alias_name'] ?? '';
             $visibleDbField = trim($fields[1]['db_field'] ?? '');
-            $visibleCol     = $visibleDbField ? $this->resolveColumn($table, $visibleDbField) : '';
+            // db_field가 원본 SQL 표현식(concat() 등)이면 컬럼명이 아니므로 백틱으로 감싸면 안 됨
+            // — 위 숨김PK 룩업과 동일한 이유(2026-09-17, carparts006116에서 재발견: 저장은 성공했지만
+            // 반환된 idx가 표현식 조회 실패로 숫자 PK로 잘못 폴백되어, 저장 직후 재조회(view)가
+            // 엉뚱한 조건으로 나감 — 여기서도 표현식이면 원본 그대로 + FROM에 table_m 별칭 필요).
+            $isExprVisible = $visibleDbField !== '' && preg_match('/[\s(\'"]/', $visibleDbField);
+            $visibleCol = $isExprVisible
+                ? $visibleDbField
+                : ($visibleDbField ? $this->resolveColumn($table, $visibleDbField) : '');
             // INSERT 인 경우 본문(updateList)에 visible-key 가 없을 수 있으므로 DB 에서 직접 조회
             if ($visibleCol !== '') {
                 try {
-                    $vs = $this->pdo->prepare("SELECT `{$visibleCol}` FROM `{$table}` WHERE `{$pkCol}` = ? LIMIT 1");
+                    $selExpr = $isExprVisible ? "({$visibleCol})" : "`{$visibleCol}`";
+                    $vs = $this->pdo->prepare("SELECT {$selExpr} FROM `{$table}` table_m WHERE `{$pkCol}` = ? LIMIT 1");
                     $vs->execute([$idx]);
                     $vk = $vs->fetchColumn();
                     if ($vk !== false && $vk !== null && (string)$vk !== '') {
@@ -1635,9 +1989,11 @@ class DataHandler
             return ['success' => false, 'message' => '삭제 권한이 없습니다.', '_access' => $accessD];
         }
         $GLOBALS['_menuAccess'] = $accessD;
-        if ($accessD['admin']) $GLOBALS['misSessionIsAdmin'] = 'Y';
 
         $this->setGlobals($params, $user, $menu, 'delete');
+        // setGlobals() 이후에 적용해야 덮어써지지 않음 (2026-08-01 버그 수정, list() 참고)
+        if ($accessD['admin']) $GLOBALS['misSessionIsAdmin'] = 'Y';
+        $this->applyDbalias($menu);
         $this->loadProgram($menu['real_pid'] ?? '', $menu);
 
         $table = $this->resolveTable(trim($menu['table_name'] ?? ''));
@@ -1646,7 +2002,7 @@ class DataHandler
         $pkCol  = $this->resolveIdxColumn($table, $fields);
 
         // read_only_cond 체크
-        if ($this->isRowReadOnly($menu, $idx, $pkCol)) {
+        if ($this->isRowReadOnly($menu, $idx, $pkCol, $user)) {
             return ['success' => false, 'message' => '이 행은 읽기전용입니다. 삭제할 수 없습니다.'];
         }
 
@@ -1666,13 +2022,18 @@ class DataHandler
             ];
         }
 
-        $deleteQuery = trim($menu['delete_query'] ?? '');
+        $deleteQuery = $this->resolveDeleteQueryCols(trim($menu['delete_query'] ?? ''), $table);
         $pkCol = $this->resolveIdxColumn($table, $fields);
         if ($deleteQuery !== '') {
-            // 삭제쿼리가 있으면 UPDATE 처리 (예: useflag=0, delchk='D')
-            $this->pdo->prepare("UPDATE `{$table}` SET {$deleteQuery} WHERE `{$pkCol}` = ?")->execute([$idx]);
+            // 삭제쿼리가 있으면 UPDATE 처리 (예: useflag=0, del_chk='D') — 데드락이면 자동 재시도.
+            // 2026-08-27 추가: 소프트삭제도 일반 저장과 동일하게 수정일자/수정자 자동 기록.
+            $auditSql = $this->buildAuditSetClause($table);
+            $this->execWithDeadlockRetry(
+                "UPDATE `{$table}` SET {$deleteQuery}{$auditSql['sql']} WHERE `{$pkCol}` = ?",
+                array_merge($auditSql['vals'], [$idx])
+            );
         } else {
-            $this->pdo->prepare("DELETE FROM `{$table}` WHERE `{$pkCol}` = ?")->execute([$idx]);
+            $this->execWithDeadlockRetry("DELETE FROM `{$table}` WHERE `{$pkCol}` = ?", [$idx]);
         }
 
         $this->callHook('save_deleteAfter', $idx, $afterScript);
@@ -1701,12 +2062,13 @@ class DataHandler
 
         $menu = $this->getMenu($gubun);
         $this->setGlobals($params, $user, $menu, 'delete');
+        $this->applyDbalias($menu);
         $this->loadProgram($menu['real_pid'] ?? '', $menu);
 
         $table = $this->resolveTable(trim($menu['table_name'] ?? ''));
         if (!$table) return ['success' => false, 'message' => '테이블 정보가 없습니다.'];
         $fields = $this->getFields($gubun, $menu, $user);
-        $pkCol  = $this->resolveIdxColumn($table, $fields);
+        $pkCol  = $this->resolveBulkIdxColumn($table, $fields);
 
         // save_bulkDeleteBefore 훅: 전체 idxList를 검증/수정 가능
         $cancelDelete = false;
@@ -1737,17 +2099,20 @@ class DataHandler
             if ($cancelOne) continue;
 
             // read_only_cond 체크 — readonly 행은 건너뜀
-            if ($this->isRowReadOnly($menu, $idx, $pkCol)) { $skipped++; continue; }
+            if ($this->isRowReadOnly($menu, $idx, $pkCol, $user)) { $skipped++; continue; }
 
             // PK 컬럼: resolveIdxColumn 결과(=실제 테이블 PK 컬럼명) 를 그대로 사용.
             // 단건 delete() 와 동일한 처리. 'idx' 컬럼이 없는 테이블(g5/carparts 등)에서도 정상 동작.
-            $deleteQuery = trim($menu['delete_query'] ?? '');
+            $deleteQuery = $this->resolveDeleteQueryCols(trim($menu['delete_query'] ?? ''), $table);
             if ($deleteQuery !== '') {
-                $stmt = $this->pdo->prepare("UPDATE `{$table}` SET {$deleteQuery} WHERE `{$pkCol}` = ?");
+                // 2026-08-27 추가: 소프트삭제도 일반 저장과 동일하게 수정일자/수정자 자동 기록.
+                $auditSql = $this->buildAuditSetClause($table);
+                $stmt = $this->pdo->prepare("UPDATE `{$table}` SET {$deleteQuery}{$auditSql['sql']} WHERE `{$pkCol}` = ?");
+                $stmt->execute(array_merge($auditSql['vals'], [$idx]));
             } else {
                 $stmt = $this->pdo->prepare("DELETE FROM `{$table}` WHERE `{$pkCol}` = ?");
+                $stmt->execute([$idx]);
             }
-            $stmt->execute([$idx]);
             // 실제 영향 받은 행만 카운트 (PK 매칭 실패 시 응답 부풀리지 않도록)
             if ($stmt->rowCount() <= 0) { continue; }
 
@@ -1886,14 +2251,16 @@ class DataHandler
         if (!preg_match('/^\s*(\w+)\s*=/', $deleteQuery, $m)) {
             return ['success' => false, 'message' => "delete_query 형식 오류: {$deleteQuery}"];
         }
-        $col = $m[1];
+        $col = $this->resolveColumn($table, $m[1]);
 
         $fieldsR = $this->getFields($gubun, $menu, $user);
-        $pkColR  = $this->resolveIdxColumn($table, $fieldsR);
+        $pkColR  = $this->resolveBulkIdxColumn($table, $fieldsR);
         $ph = implode(',', array_fill(0, count($idxList), '?'));
-        $sql = "UPDATE `{$table}` SET `{$col}` = '1' WHERE `{$pkColR}` IN ({$ph})";
+        // 2026-08-27 추가: 복원도 delete_query 반대방향의 UPDATE이므로 동일하게 수정일자/수정자 기록.
+        $auditSql = $this->buildAuditSetClause($table);
+        $sql = "UPDATE `{$table}` SET `{$col}` = '1'{$auditSql['sql']} WHERE `{$pkColR}` IN ({$ph})";
         $stmt = $this->pdo->prepare($sql);
-        $stmt->execute($idxList);
+        $stmt->execute(array_merge($auditSql['vals'], $idxList));
         $affected = $stmt->rowCount();
 
         $this->postWriteInvalidate($menu, $gubun);
@@ -1909,7 +2276,7 @@ class DataHandler
         if ($err) return $err;
 
         $fieldsP = $this->getFields($gubun, $menu, $user);
-        $pkColP  = $this->resolveIdxColumn($table, $fieldsP);
+        $pkColP  = $this->resolveBulkIdxColumn($table, $fieldsP);
         $ph = implode(',', array_fill(0, count($idxList), '?'));
         $sql = "DELETE FROM `{$table}` WHERE `{$pkColP}` IN ({$ph})";
         $stmt = $this->pdo->prepare($sql);
@@ -1949,10 +2316,11 @@ class DataHandler
      * 특정 idx 가 read_only_cond 평가 결과 '1' 인지 확인 (읽기전용 여부)
      * 읽기전용이면 true → 수정/삭제 차단
      */
-    private function isRowReadOnly(array $menu, int|string $idx, ?string $pkCol = null): bool
+    private function isRowReadOnly(array $menu, int|string $idx, ?string $pkCol = null, ?object $user = null): bool
     {
         $cond = trim($menu['read_only_cond'] ?? '');
         if ($cond === '') return false;
+        $cond = $this->resolveSessionPlaceholders($cond, $menu, $user);
         $table = $this->resolveTable(trim($menu['table_name'] ?? ''));
         if (!$table) return false;
         try {
@@ -1973,13 +2341,27 @@ class DataHandler
     /**
      * delete_query ("useflag=0" 형태) → WHERE 조건 문자열 ("table_m.useflag = '0'")
      */
-    private function deleteQueryToCondition(string $deleteQuery): string
+    private function deleteQueryToCondition(string $deleteQuery, string $mainTable = ''): string
     {
         if ($deleteQuery === '') return '';
         if (!preg_match('/^\s*(\w+)\s*=\s*[\'"]?([^\'"]*)[\'"]?\s*$/', $deleteQuery, $m)) return '';
-        $col = $m[1];
+        $col = $mainTable !== '' ? $this->resolveColumn($mainTable, $m[1]) : $m[1];
         $val = $m[2];
         return "table_m.`{$col}` = '" . addslashes($val) . "'";
+    }
+
+    /**
+     * delete_query ("useflag=0" 또는 "useflag=0, delchk='D'" 형태) 안의 v6 컬럼명(delchk 등)을
+     * v7 실제 컬럼명(del_chk 등)으로 치환 — SET 절/컬럼 추출 등 delete_query 를 raw 로 쓰는 모든 곳에서 공용.
+     */
+    private function resolveDeleteQueryCols(string $deleteQuery, string $table): string
+    {
+        if ($deleteQuery === '' || $table === '') return $deleteQuery;
+        return preg_replace_callback(
+            '/([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)/',
+            fn($m) => $this->resolveColumn($table, $m[1]) . $m[2],
+            $deleteQuery
+        ) ?? $deleteQuery;
     }
 
     // =========================================================================
@@ -2010,6 +2392,28 @@ class DataHandler
         return $this->resolveColumn($table, $pkDbField ?: 'idx');
     }
 
+    /**
+     * 일괄작업(bulkDelete/bulkRestore/bulkPermanentDelete) 전용 PK 컬럼 결정.
+     *
+     * DataGrid.jsx 의 체크박스 선택값은 항상 `r.idx ?? r[pkAlias]` (rows.map 참고) — 즉
+     * fields 중 alias_name==='idx' 인 필드가 있으면 col_width(숨김여부) 와 무관하게 그 필드의
+     * *값*이 idxList 로 전송된다. resolveIdxColumn() 은 반대로 col_width 로만 판단해 PK가 숨김이면
+     * 다른(첫 visible) 필드로 대체해버려서, alias_name==='idx' 필드가 숨김 처리된 메뉴(예: edu001087,
+     * fields[0]: alias_name=idx, db_field=idx, col_width=-1)에서는 프론트가 보낸 실제 idx 값과
+     * 백엔드가 매칭하려는 컬럼이 서로 달라져 대상 0건(성공 응답인데 실제로는 아무 것도 안 됨)이 된다.
+     * 그래서 일괄작업만은 프론트와 동일하게 "alias_name==='idx' 필드 우선"으로 판단한다.
+     */
+    private function resolveBulkIdxColumn(string $table, array $fields): string
+    {
+        foreach ($fields as $f) {
+            if (trim($f['alias_name'] ?? '') !== 'idx') continue;
+            $dbTable = trim($f['db_table'] ?? 'table_m');
+            if ($dbTable !== '' && $dbTable !== 'table_m') continue; // 조인 컬럼 제외
+            return $this->resolveColumn($table, trim($f['db_field'] ?? '') ?: 'idx');
+        }
+        return $this->resolveIdxColumn($table, $fields);
+    }
+
     // =========================================================================
     // treat 훅 (act=treat)
     // =========================================================================
@@ -2017,7 +2421,19 @@ class DataHandler
     {
         $gubun = (int)($params['gubun'] ?? 0);
         $menu  = $this->getMenu($gubun);
+
+        $userIdT = (string)($user->uid ?? '');
+        $globalAdminT = ($user->is_admin ?? '') === 'Y' ? 'Y' : '';
+        $accessT = $this->checkMenuAccess($menu, $userIdT, $globalAdminT);
+
         $this->setGlobals($params, $user, $menu, 'treat');
+        // setGlobals() 이후에 적용해야 덮어써지지 않음 (2026-08-01 버그 수정, list() 참고) —
+        // treat() 에는 이 승격 로직이 누락돼 있어서, 그룹기반 admin(계정 자체엔 is_admin='Y'가
+        // 없고 mis_menu_auth의 authority_level=3 으로만 admin인 경우, 예: 'admin')이
+        // addLogic_treat 훅에서 misSessionIsAdmin 을 확인하면 항상 비admin으로 보이는
+        // 문제가 있었음 (2026-08-02, edu001099 삭제권한 확장 중 발견).
+        if ($accessT['admin']) $GLOBALS['misSessionIsAdmin'] = 'Y';
+        $this->applyDbalias($menu);
         $this->loadProgram($menu['real_pid'] ?? '', $menu);
 
         $result = array_merge($params, $body);
@@ -2502,7 +2918,8 @@ class DataHandler
                         up_real_pid, auth_code, add_logic,
                         table_name, base_filter, use_condition, delete_query,
                         read_only_cond, brief_insert_sql,
-                        is_use_print, g01, g02, g03, g07
+                        (is_use_print+0) AS is_use_print, g01, g02, g03, g07,
+                        dbalias
                    FROM mis_menus
                   WHERE idx = ? LIMIT 1'
             );
@@ -2515,16 +2932,22 @@ class DataHandler
                 if ($joinRealPid !== '') {
                     $menu['_fields_real_pid'] = $joinRealPid; // getFields/loadProgram 대상
 
-                    // 조인 메뉴에서 비어있는 속성 상속 — table_name / base_filter / g01 / g02 / g03 / g07
+                    // 조인 메뉴에서 비어있는 속성 상속 — table_name / base_filter / g01 / g02 / g03 / g07 / read_only_cond / delete_query
                     // (예: 6140 = MisJoin of 631 → 631 의 g03='Y' 상속하여 recently=OFF 동작)
+                    // read_only_cond 누락 시 조인 메뉴는 원본 메뉴의 읽기전용 조건(기간마감 등)을 전혀 상속받지 못해
+                    // 수정 버튼도 항상 노출되고 save()/delete() 의 isRowReadOnly() 차단도 무력화됨 (2026-07-29 edu 1078 사례).
+                    // delete_query 누락 시 조인 메뉴에서의 삭제는 원본 메뉴의 소프트삭제 규칙(예: useflag=0)을
+                    // 전혀 상속받지 못해 실제 DELETE FROM 이 나가버림 — 2026-08-14 실사고로 발견
+                    // (carparts006083=소프트삭제 인데 join 메뉴 6112/6165~6168/6197 등에서 삭제하면
+                    // 진짜 삭제돼서 상품 430건이 통째로 사라짐, 백업에서 복구).
                     $js = $this->pdo->prepare(
-                        'SELECT table_name, base_filter, g01, g02, g03, g07
+                        'SELECT table_name, base_filter, g01, g02, g03, g07, read_only_cond, delete_query, (is_use_print+0) AS is_use_print
                            FROM mis_menus WHERE real_pid = ? LIMIT 1'
                     );
                     $js->execute([$joinRealPid]);
                     $joinMenu = $js->fetch() ?: [];
 
-                    foreach (['table_name', 'base_filter', 'g01', 'g02', 'g03', 'g07'] as $col) {
+                    foreach (['table_name', 'base_filter', 'g01', 'g02', 'g03', 'g07', 'read_only_cond', 'delete_query', 'is_use_print'] as $col) {
                         $cur = trim((string)($menu[$col] ?? ''));
                         $par = trim((string)($joinMenu[$col] ?? ''));
                         if ($cur === '' && $par !== '') {
@@ -2570,7 +2993,7 @@ class DataHandler
                                 f.grid_list_edit, f.grid_ctl_name, f.prime_key,
                                 f.schema_validation, f.grid_templete, f.useflag,
                                 f.grid_view_class, f.grid_view_hight, (f.grid_enter + 0) AS grid_enter,
-                                f.grid_view_sm, f.grid_view_md, f.grid_view_lg, f.grid_view_xl,
+                                f.grid_view_xs, f.grid_view_sm, f.grid_view_md, f.grid_view_lg, f.grid_view_xl,
                                 f.grid_view_fixed,
                                 f.grid_alim, f.idx, f.real_pid AS field_real_pid
                            FROM mis_menu_fields f
@@ -2587,7 +3010,7 @@ class DataHandler
                                 f.grid_list_edit, f.grid_ctl_name, f.prime_key,
                                 f.schema_validation, f.grid_templete, f.useflag,
                                 f.grid_view_class, f.grid_view_hight, (f.grid_enter + 0) AS grid_enter,
-                                f.grid_view_sm, f.grid_view_md, f.grid_view_lg, f.grid_view_xl,
+                                f.grid_view_xs, f.grid_view_sm, f.grid_view_md, f.grid_view_lg, f.grid_view_xl,
                                 f.grid_view_fixed,
                                 f.grid_alim, f.idx, f.real_pid AS field_real_pid
                            FROM mis_menu_fields f
@@ -2627,7 +3050,11 @@ class DataHandler
         if ($s === '' || (!str_contains($s, '@') && !str_contains($s, '$'))) return $s;
 
         $uid      = $user->uid            ?? ($GLOBALS['misSessionUserId']       ?? '');
-        $isAdmin  = (($user->is_admin    ?? ($GLOBALS['misSessionIsAdmin']       ?? '')) === 'Y') ? 'Y' : '';
+        // 글로벌 admin($user->is_admin) 뿐 아니라 메뉴별 authority_level=3 승격($GLOBALS['misSessionIsAdmin'],
+        // list/view/save/delete 에서 setGlobals() 이후 세팅됨)도 인정해야 함 — ?? 로 우선순위만 매기면
+        // $user->is_admin 이 항상 정의돼(빈 문자열이라도) 있어 뒤의 GLOBALS 폴백이 절대 적용 안 되는 버그였음
+        // (2026-08-01, read_only_cond 의 @misSessionIsAdmin 이 메뉴별 admin 에게 항상 ''로 풀리던 문제).
+        $isAdmin  = (($user->is_admin ?? '') === 'Y' || ($GLOBALS['misSessionIsAdmin'] ?? '') === 'Y') ? 'Y' : '';
         $posCode  = $user->position_code  ?? ($GLOBALS['misSessionPositionCode'] ?? '');
         $stationN = $user->station_idx    ?? ($GLOBALS['misSessionStationNum']   ?? '');
         $realPid  = $menu['real_pid']     ?? ($GLOBALS['real_pid']               ?? '');
@@ -2712,6 +3139,83 @@ class DataHandler
             if ($mid !== '' && isset($cmap[$mid])) $r['__commentCount'] = $cmap[$mid];
         }
         unset($r);
+    }
+
+    /**
+     * 리스트행별 child 이력건수 뱃지(__listCount) — 댓글뱃지(_attachCommentData)와 동일 패턴이지만
+     * 대상은 mis_comments 가 아니라 이 메뉴의 grid_ctl_name='child' 필드 하나(alias_name=
+     * $GLOBALS['_listCountAlias'] 로 지정)가 가리키는 child 프로그램의 행 수.
+     * pageLoad() 에서 $GLOBALS['_listCountAlias'] = '<child 필드 alias_name>'; 로 켠다
+     * (2026-08-14 신설 — 사용자 요청: 댓글뱃지와 완전히 동일한 UI/클릭동작을 다른 child 탭에도).
+     *
+     * child 필드 default_value = 대상 real_pid. 그 real_pid 의 mis_menu_fields 는 parent_idx
+     * 자동필터 컨벤션과 동일하게 sort_order 1번=PK, 2번=FK 로 구성돼 있어야 함(list()/view() 의
+     * parent_idx 처리부와 동일 컨벤션).
+     */
+    private function _attachListCountData(array &$result, array $menu): void
+    {
+        $alias = trim((string)($GLOBALS['_listCountAlias'] ?? ''));
+        if ($alias === '') return;
+
+        $fieldsRealPid = trim((string)($menu['_fields_real_pid'] ?? '')) ?: trim((string)($menu['real_pid'] ?? ''));
+        if ($fieldsRealPid === '') return;
+
+        try {
+            $fst = $this->pdo->prepare(
+                "SELECT default_value FROM mis_menu_fields
+                  WHERE real_pid = ? AND alias_name = ? AND grid_ctl_name = 'child' LIMIT 1"
+            );
+            $fst->execute([$fieldsRealPid, $alias]);
+            $childRealPid = trim((string)($fst->fetchColumn() ?: ''));
+            if ($childRealPid === '') return;
+
+            $mst = $this->pdo->prepare("SELECT idx, table_name FROM mis_menus WHERE real_pid = ? LIMIT 1");
+            $mst->execute([$childRealPid]);
+            $childMenu = $mst->fetch(\PDO::FETCH_ASSOC);
+            if (!$childMenu) return;
+            $childGubun = (int)($childMenu['idx'] ?? 0);
+            $childTable = trim((string)($childMenu['table_name'] ?? ''));
+            if ($childGubun <= 0 || $childTable === '' || !preg_match('/^[A-Za-z0-9_]+$/', $childTable)) return;
+
+            // FK 컬럼 — parent_idx 컨벤션과 동일(2번째 sort_order 필드)
+            $fkst = $this->pdo->prepare(
+                "SELECT db_field FROM mis_menu_fields WHERE real_pid = ? ORDER BY sort_order LIMIT 1 OFFSET 1"
+            );
+            $fkst->execute([$childRealPid]);
+            $fkCol = trim((string)($fkst->fetchColumn() ?: ''));
+            if ($fkCol === '' || !preg_match('/^[A-Za-z0-9_]+$/', $fkCol)) return;
+
+            $result['_listCountAlias'] = $alias;
+            $result['_listCountGubun'] = $childGubun;
+
+            if (empty($result['data']) || !is_array($result['data'])) return;
+            $pkAlias = $result['fields'][0]['alias_name'] ?? 'idx';
+            $idxs = [];
+            foreach ($result['data'] as $r) {
+                $v = $r[$pkAlias] ?? $r['idx'] ?? null;
+                if ($v !== '' && $v !== null) $idxs[] = (string)$v;
+            }
+            $idxs = array_values(array_unique($idxs));
+            if (!$idxs) return;
+
+            $ph = implode(',', array_fill(0, count($idxs), '?'));
+            $cst = $this->pdo->prepare(
+                "SELECT `{$fkCol}` AS fk, COUNT(*) c FROM `{$childTable}` WHERE `{$fkCol}` IN ({$ph}) GROUP BY `{$fkCol}`"
+            );
+            $cst->execute($idxs);
+            $cmap = [];
+            foreach ($cst->fetchAll(\PDO::FETCH_ASSOC) ?: [] as $r) {
+                $cmap[(string)$r['fk']] = (int)$r['c'];
+            }
+            if (!$cmap) return;
+            foreach ($result['data'] as &$r) {
+                $pid = (string)($r[$pkAlias] ?? $r['idx'] ?? '');
+                if ($pid !== '' && isset($cmap[$pid])) $r['__listCount'] = $cmap[$pid];
+            }
+            unset($r);
+        } catch (\Throwable $e) {
+            // 조용히 무시 — 뱃지가 안 보이는 정도로 그치고 리스트 자체는 정상 동작해야 함
+        }
     }
 
     private function loadProgram(string $real_pid, array $menu = []): void
@@ -2837,10 +3341,52 @@ class DataHandler
      *
      * g07='Y' (메뉴 읽기전용) 은 데이터 write 만 차단 — admin 역할(도움말 작성, 디자이너 등) 자체는 유지.
      */
+    // '참조입력' 버튼을 숨길 메뉴 트리의 루트 real_pid 목록 — 여기 하위(다단계 폴더 포함)
+    // 모든 프로그램에 일괄 적용됨. (2026-08-01, 865=학사관리 요청)
+    private const HIDE_REFER_INSERT_ROOTS = ['speedmis000865'];
+
+    /**
+     * $realPid 가 $rootRealPid 트리 하위(자기자신 포함, 다단계 폴더 관통)인지 여부.
+     * up_real_pid 체인을 거꾸로(자식→루트 방향) 타고 올라가며 확인 — 트리 규모가 커도
+     * 대상 노드 1개당 최대 depth 만큼만 조회하면 되므로 전체 서브트리를 미리 구할 필요 없음.
+     */
+    private function isMenuUnderRoot(string $realPid, string $rootRealPid): bool
+    {
+        if ($realPid === '' || $rootRealPid === '') return false;
+        if ($realPid === $rootRealPid) return true;
+        $cacheKey = "ancestors:{$realPid}";
+        $chain = $this->cache->getSchema('menuTree', $cacheKey);
+        if (!is_array($chain)) {
+            $chain = [];
+            $cur = $realPid;
+            for ($i = 0; $i < 20 && $cur !== ''; $i++) {
+                $st = $this->pdo->prepare('SELECT up_real_pid FROM mis_menus WHERE real_pid = ? LIMIT 1');
+                $st->execute([$cur]);
+                $parent = trim((string)($st->fetchColumn() ?: ''));
+                if ($parent === '' || $parent === $cur || in_array($parent, $chain, true)) break;
+                $chain[] = $parent;
+                $cur = $parent;
+            }
+            $this->cache->setSchema('menuTree', $cacheKey, $chain);
+        }
+        return in_array($rootRealPid, $chain, true);
+    }
+
     private function checkMenuAccess(array $menu, string $userId, string $isGlobalAdmin): array
     {
         // 메뉴 자체 읽기전용 플래그 (g07='Y') — 데이터 write 차단. admin 권한은 유지.
         $menuReadOnly = (string)($menu['g07'] ?? '') === 'Y';
+
+        $realPidForTree = (string)($menu['real_pid'] ?? '');
+        // .env HIDE_REFER_INSERT_ALL=1 이면 이 사이트 전체(모든 메뉴)에서 참조입력 버튼 숨김.
+        // core(gapm/v7)는 부자톡/kimgo/account 가 symlink 로 공유하므로, 사이트별로 다른 .env 로만
+        // 특정 사이트에 한정시킬 수 있음(2026-08-19, 부자톡 전용 요청).
+        $hideReferInsert = (($_ENV['HIDE_REFER_INSERT_ALL'] ?? '') === '1');
+        if (!$hideReferInsert) {
+            foreach (self::HIDE_REFER_INSERT_ROOTS as $root) {
+                if ($this->isMenuUnderRoot($realPidForTree, $root)) { $hideReferInsert = true; break; }
+            }
+        }
 
         // 글로벌 admin: write 만 g07 따라 제한, admin/read 는 항상 true
         $full = [
@@ -2848,12 +3394,13 @@ class DataHandler
             'read'  => true,
             'write' => !$menuReadOnly,
             'admin' => true,
+            'hideReferInsert' => $hideReferInsert,
         ];
         if ($isGlobalAdmin === 'Y') return $full;
 
         $realPid = (string)($menu['real_pid'] ?? '');
         if ($realPid === '' || $userId === '') {
-            return ['level' => 'deny', 'read' => false, 'write' => false, 'admin' => false];
+            return ['level' => 'deny', 'read' => false, 'write' => false, 'admin' => false, 'hideReferInsert' => $hideReferInsert];
         }
 
         $stmt = $this->pdo->prepare(
@@ -2903,7 +3450,7 @@ class DataHandler
         }
 
         $level = $admin ? 'admin' : ($write ? 'write' : ($read ? 'read' : 'deny'));
-        return ['level' => $level, 'read' => $read, 'write' => $write, 'admin' => $admin];
+        return ['level' => $level, 'read' => $read, 'write' => $write, 'admin' => $admin, 'hideReferInsert' => $hideReferInsert];
     }
 
     /**
@@ -2919,6 +3466,75 @@ class DataHandler
      * 저장값 우측 끝 공백류 정리 — 스페이스/탭/개행 + NBSP(\x{00A0}) + 전각공백(\x{3000}) 만 제거.
      * 앞쪽·중간 공백은 사용자 의도일 수 있으므로 보존(RTRIM only). 문자열이 아니면 그대로 반환.
      */
+    /**
+     * mis_menu_fields INSERT 시 뷰 레이아웃 컬럼 기본값 자동 채움.
+     * grid_view_xl/lg/md/sm/hight 가 비어있으면 grid_ctl_name·max_length 통계 기반 값 적용.
+     *
+     * 통계 기준 (2026-03 이전 데이터 빈도수):
+     *   기본:                3/3/3/6/1
+     *   text(max_len 11-50): 3/3/6/6/1
+     *   text(max_len 51-200):6/12/12/12/1
+     *   text(max_len 201+) / textarea: 12/12/12/12/1
+     *   html:                12/12/12/12/60
+     *   attach / image:      6/6/6/12/54
+     */
+    private function applyFieldLayoutDefaults(string $table, array &$data): void
+    {
+        // mis_menu_fields 테이블만 대상 (resolve 후 이름이 다를 수 있으므로 양쪽 매칭)
+        $t = strtolower($this->resolveTable($table));
+        if ($t !== 'mis_menu_fields' && $t !== 'mismenulist_detail') return;
+
+        // 하나라도 명시적으로 설정되어 있으면 사용자 의도 존중 → skip
+        $layoutCols = ['grid_view_xl','grid_view_lg','grid_view_md','grid_view_sm','grid_view_hight'];
+        $allEmpty = true;
+        foreach ($layoutCols as $c) {
+            if (isset($data[$c]) && $data[$c] !== '' && $data[$c] !== null) {
+                $allEmpty = false;
+                break;
+            }
+        }
+        if (!$allEmpty) return;
+
+        $ctl    = strtolower(trim((string)($data['grid_ctl_name'] ?? '')));
+        $schema = strtolower(trim((string)($data['schema_type']   ?? '')));
+        $maxLen = (int)($data['max_length'] ?? 0);
+
+        $isHtml     = ($ctl === 'html'     || $schema === 'html');
+        $isAttach   = ($ctl === 'attach'   || $ctl === 'image');
+        $isTextarea = ($ctl === 'textarea' || $schema === 'textarea');
+        $isText     = ($ctl === 'text');
+
+        if ($isHtml) {
+            // html(Quill): 전폭, 높이 60
+            [$xl, $lg, $md, $sm, $h] = [12, 12, 12, 12, 60];
+        } elseif ($isAttach) {
+            // 첨부/이미지: 전폭, 높이 54
+            [$xl, $lg, $md, $sm, $h] = [6, 6, 6, 12, 54];
+        } elseif ($isTextarea) {
+            // textarea: 전폭, 높이 4 (기본) — max_length 큰 건 높이 더 줌
+            [$xl, $lg, $md, $sm, $h] = [12, 12, 12, 12, 4];
+        } elseif ($isText && $maxLen > 200) {
+            // text(장문 201+): 전폭
+            [$xl, $lg, $md, $sm, $h] = [12, 12, 12, 12, 1];
+        } elseif ($isText && $maxLen > 50) {
+            // text(중간 51-200): 반폭~전폭
+            [$xl, $lg, $md, $sm, $h] = [6, 12, 12, 12, 1];
+        } elseif ($isText && $maxLen > 10) {
+            // text(짧은 11-50): 1/4~반폭
+            [$xl, $lg, $md, $sm, $h] = [3, 3, 6, 6, 1];
+        } else {
+            // 기본 (일반 필드, check, dropdownitem, datepicker, numerictextbox 등)
+            [$xl, $lg, $md, $sm, $h] = [3, 3, 3, 6, 1];
+        }
+
+        $data['grid_view_xl']    = $xl;
+        $data['grid_view_lg']    = $lg;
+        $data['grid_view_md']    = $md;
+        $data['grid_view_sm']    = $sm;
+        $data['grid_view_hight'] = $h;
+        $data['grid_view_fixed'] = 0;
+    }
+
     private function rtrimWs($v)
     {
         if (!is_string($v)) return $v;
@@ -3037,6 +3653,31 @@ class DataHandler
         }
         // 중복 제거 (같은 컬럼이 후보에 중복 명시된 경우)
         return array_values(array_unique($out));
+    }
+
+    /**
+     * delete_query 기반 소프트삭제/복원 UPDATE(delete()/bulkDelete()/bulkRestore())에 감사(audit)
+     * 컬럼(수정자/수정일)을 덧붙이기 위한 헬퍼(2026-08-27 신설, 사용자 요청 - "core 변경: 삭제
+     * 또는 복원할 때 delete가 아닌 update 문을 실행하는 경우, flag 변경 뿐만 아니라 수정일자,
+     * 수정자사번도 함께 update"). buildUpdate()와 동일한 resolveAuditCols() 재사용 - 새 방식을
+     * 따로 만들지 않고 일반 저장과 완전히 같은 컬럼탐색 규칙을 그대로 적용.
+     * @return array{sql:string, vals:array} sql은 ", `col`=?, `col2`=NOW()" 형태(선두 콤마 포함,
+     *         해당 컬럼이 테이블에 없으면 빈 문자열), vals는 '?' 자리에 대응하는 값 배열(순서 보장).
+     */
+    private function buildAuditSetClause(string $table): array
+    {
+        $userId = $GLOBALS['misSessionUserId'] ?? '';
+        $cols = $this->getTableColumnSet($table);
+        $sets = [];
+        $vals = [];
+        foreach ($this->resolveAuditCols($cols, 'updater') as $c) {
+            $sets[] = "`{$c}`=?"; $vals[] = $userId;
+        }
+        foreach ($this->resolveAuditCols($cols, 'updated') as $c) {
+            $sets[] = "`{$c}`=NOW()";
+        }
+        if (empty($sets)) return ['sql' => '', 'vals' => []];
+        return ['sql' => ', ' . implode(', ', $sets), 'vals' => $vals];
     }
 
     private function buildInsert(string $table, array $data, array $encCols = [], string $pwdKey = ''): array
@@ -3295,14 +3936,17 @@ class DataHandler
      *  - 'sum'         : 실데이터 + 부분합/총합 (숫자만 합계, 그 외는 공란)
      *  - 'simple.auto' : 실데이터 숨김, 부분합/총합만 (숫자=합계, 그 외=건수)
      *  - 'simple.sum'  : 실데이터 숨김, 부분합/총합만 (숫자만 합계, 그 외는 공란)
+     *  - 'total.auto'  : 실데이터+부분합 숨김, 총합만 (숫자=합계, 그 외=건수)
+     *  - 'total.sum'   : 실데이터+부분합 숨김, 총합만 (숫자만 합계, 그 외는 공란)
      * simple 모드는 각 부분합 행에 __agg_rows(소속 실데이터 배열)을 첨부 → 클릭 시 팝업 표시용.
      */
     private function buildAggregateRows(array $data, array $fields, string $effectiveOrderby, string $mode): array
     {
         if (empty($data)) return $data;
 
+        $totalOnly = str_starts_with($mode, 'total.');
         $simple    = str_starts_with($mode, 'simple.');
-        $rawMode   = $simple ? substr($mode, 7) : $mode;
+        $rawMode   = $totalOnly ? substr($mode, 6) : ($simple ? substr($mode, 7) : $mode);
         $showCount = ($rawMode === 'auto'); // auto: 숫자외=건수, sum: 숫자외=공란
 
         // orderby alias 파싱 (부호 제거, __recently__ 제외)
@@ -3367,7 +4011,14 @@ class DataHandler
                     $row[$a] = $agg[$a] ?? 0;
                     $html[$a] = '<span class="font-bold text-primary">' . htmlspecialchars($formatNum($row[$a]), ENT_QUOTES, 'UTF-8') . '</span>';
                 } else {
-                    if ($showCount) {
+                    // 소계 1건: 숫자가 아닌 항목은 원본 값 그대로 표시
+                    $grpCount = $agg['__count'] ?? 0;
+                    if ($grpCount === 1 && !empty($refRow)) {
+                        $val = $refRow[$a] ?? '';
+                        $row[$a] = $val;
+                        $disp = ($val === '' || $val === null) ? '' : htmlspecialchars((string)$val, ENT_QUOTES, 'UTF-8');
+                        $html[$a] = $disp !== '' ? '<span class="text-primary">' . $disp . '</span>' : '';
+                    } elseif ($showCount) {
                         // 필드별 건수: 값이 비어있지 않은 행만 카운트
                         $row[$a] = $agg['__count_' . $a] ?? 0;
                         $html[$a] = '<span class="italic font-normal text-secondary">' . htmlspecialchars($formatNum($row[$a]), ENT_QUOTES, 'UTF-8') . '</span>';
@@ -3415,9 +4066,9 @@ class DataHandler
                 $key .= $this->rtrimWs((string)($row[$a] ?? '')) . "\x1F";
             }
 
-            // 그룹 변경 시 이전 그룹 subtotal 주입
+            // 그룹 변경 시 이전 그룹 subtotal 주입 (total 전용 모드에서는 소계 생략)
             if (!empty($orderAliases) && $currentKey !== null && $key !== $currentKey) {
-                $result[] = $makeAggRow($groupAgg, 'subtotal', $groupRows);
+                if (!$totalOnly) $result[] = $makeAggRow($groupAgg, 'subtotal', $groupRows);
                 $groupAgg = ['__count' => 0];
                 $groupRows = [];
             }
@@ -3444,13 +4095,13 @@ class DataHandler
             // 모든 모드에서 클릭 팝업용 원본 데이터 누적
             $groupRows[] = $row;
             $allRows[]   = $row;
-            if (!$simple) {
+            if (!$simple || $totalOnly) {
                 $result[] = $row;
             }
         }
 
-        // 마지막 그룹 subtotal
-        if (!empty($orderAliases) && $groupAgg['__count'] > 0) {
+        // 마지막 그룹 subtotal (total 전용 모드에서는 소계 생략)
+        if (!$totalOnly && !empty($orderAliases) && $groupAgg['__count'] > 0) {
             $result[] = $makeAggRow($groupAgg, 'subtotal', $groupRows);
         }
 
@@ -3611,6 +4262,7 @@ class DataHandler
                 'grid_ctlname'              => 'grid_ctl_name',
                 'grid_listedit'             => 'grid_list_edit',
                 'grid_view_fixed'           => 'grid_view_fixed',
+                'grid_view_xs'              => 'grid_view_xs',
                 'grid_view_sm'              => 'grid_view_sm',
                 'grid_view_md'              => 'grid_view_md',
                 'grid_view_lg'              => 'grid_view_lg',
@@ -4317,15 +4969,19 @@ class DataHandler
         try {
             // user_id 까지 함께 기록 (이전엔 wdater 누락으로 NULL 만 남았음)
             $uid = (string)($user->uid ?? '');
+            // MSSQL/PG 는 큰따옴표를 식별자로 해석("1" → 컬럼명 취급, Invalid column name 에러) — 반드시 파라미터 바인딩.
+            // NOW()/GETDATE() 드라이버 분기 대신 PHP date() 로 계산해 바인딩 — 모든 드라이버에서 동일하게 동작.
             $this->pdo->prepare(
                 'INSERT INTO mis_activity_logs (log_type, menu_idx, link_result, ip, wdate, wdater, useflag)
-                 VALUES (?,?,?,?,NOW(),?,"1")'
+                 VALUES (?,?,?,?,?,?,?)'
             )->execute([
                 $action,
                 $gubun,
                 (string)$idx,
                 $_SERVER['REMOTE_ADDR'] ?? '',
+                date('Y-m-d H:i:s'),
                 $uid,
+                '1',
             ]);
         } catch (\Throwable) {}
     }
@@ -4341,16 +4997,20 @@ class DataHandler
             $rp  = trim((string)($menu['real_pid'] ?? ''));
             $uid = (string)($user->uid ?? '');
             if ($rp === '' || $uid === '') return;
+            $now = date('Y-m-d H:i:s');
             $this->pdo->prepare(
                 'INSERT INTO mis_read_history
                     (real_pid, widx, user_id, 자격, wdate, wdater, read_date, hit, useflag)
-                 VALUES (?, ?, ?, ?, NOW(), ?, NOW(), 1, "1")'
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)'
             )->execute([
                 $rp,
                 (string)$idx,
                 $uid,
                 $jagyeok,
+                $now,
                 $uid,
+                $now,
+                '1',
             ]);
         } catch (\Throwable $e) {
             $this->logger->warning('logReadHistory failed', ['err' => $e->getMessage()]);

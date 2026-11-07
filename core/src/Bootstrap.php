@@ -16,11 +16,6 @@ class Bootstrap
         $dotenv = \Dotenv\Dotenv::createImmutable(BASE_PATH);
         $dotenv->safeLoad();
 
-        // SITE_ID 자동 갱신 (IP→도메인 전환 감지). SITE_ID_AUTO=pending 일 때만 동작.
-        if (defined('BASE_PATH') && is_file(BASE_PATH . '/.env')) {
-            SiteId::reconcile(BASE_PATH . '/.env');
-        }
-
         // ── DI 컨테이너 ───────────────────────────────────────────────────────
         $builder = new ContainerBuilder();
         $builder->addDefinitions(self::definitions());
@@ -56,9 +51,12 @@ class Bootstrap
             }
 
             // GET → csrf_token 쿠키 자동 발급 (없을 때만)
+            // expires 필수 — 없으면 세션쿠키가 되어 모바일(백그라운드 전환/OS 메모리회수)에서
+            // 브라우저가 임의로 삭제, JS 캐시된 토큰과 어긋나 CSRF 오류 유발.
             if ($request->getMethod() === 'GET' && empty($_COOKIE['csrf_token'])) {
                 $newToken = bin2hex(random_bytes(16));
                 setcookie('csrf_token', $newToken, [
+                    'expires'  => time() + 28800, // 8시간 — act=csrf 명시적 발급(1시간)보다 넉넉히
                     'path'     => '/',
                     'httponly' => false, // JS 가 읽어서 헤더에 동봉 가능해야 함
                     'samesite' => 'Lax',
@@ -69,7 +67,7 @@ class Bootstrap
 
             if ($request->getMethod() === 'POST') {
                 $act = $request->getQueryParams()['act'] ?? '';
-                if (!in_array($act, ['login', 'refresh'], true)) {
+                if (!in_array($act, ['login', 'refresh', 'otpVerify', 'fidoLoginOptions', 'fidoLoginVerify'], true)) {
                     $csrf = $request->getHeaderLine('X-CSRF-Token');
                     // 헤더가 없으면 form body 의 _csrf 필드도 fallback (iframe 내부 form POST 호환)
                     if ($csrf === '') {

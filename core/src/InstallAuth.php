@@ -243,7 +243,8 @@ HTML;
     {
         $uidHint = isset($_COOKIE['access_token']) ? '(세션 만료 또는 권한 부족)' : '';
         header('HTTP/1.1 401 Unauthorized');
-        $loginUrl = '/';
+        $basePath = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
+        $loginUrl = $basePath ?: '/';
         $safeName = htmlspecialchars($pageName, ENT_QUOTES, 'UTF-8');
         $safeHint = htmlspecialchars($uidHint, ENT_QUOTES, 'UTF-8');
         echo <<<HTML
@@ -366,5 +367,97 @@ HTML;
             if (str_contains($lower, $needle)) return true;
         }
         return false;
+    }
+
+    /**
+     * 클라이언트 IP 반환 (프록시/CDN 헤더 우선)
+     */
+    public static function getClientIp(): string
+    {
+        foreach (['HTTP_CF_CONNECTING_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP', 'REMOTE_ADDR'] as $k) {
+            $v = $_SERVER[$k] ?? '';
+            if ($v === '') continue;
+            $ip = trim(explode(',', $v)[0]);
+            if ($ip !== '') return substr($ip, 0, 45);
+        }
+        return '';
+    }
+
+    /**
+     * 현재 클라이언트 IP가 OTP_TRUSTED_IPS 대역에 포함되는지 확인.
+     * 포함되면 true (= OTP 생략 가능), 미포함이면 false (= OTP 필요).
+     */
+    public static function isOtpTrustedIp(): bool
+    {
+        $raw = trim((string)($_ENV['OTP_TRUSTED_IPS'] ?? ''));
+        if ($raw === '') return false;
+
+        $clientIp = self::getClientIp();
+        if ($clientIp === '') return false;
+
+        $ranges = array_map('trim', explode(',', $raw));
+        foreach ($ranges as $range) {
+            if ($range === '') continue;
+            if (self::ipMatch($clientIp, $range)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * IP 매칭. 지원 형식:
+     *   - 단일 IP:    211.45.163.88
+     *   - 와일드카드: 192.168.1.*  또는  192.168.*.*
+     *   - 대역 앞자리: 192.168.1.  (뒤에 점으로 끝나면 해당 대역 전체)
+     *   - CIDR:      192.168.1.0/24 (고급 사용자용)
+     */
+    private static function ipMatch(string $ip, string $pattern): bool
+    {
+        $pattern = trim($pattern);
+        if ($pattern === '') return false;
+
+        // CIDR 표기 (/숫자)
+        if (str_contains($pattern, '/')) {
+            return self::ipInCidr($ip, $pattern);
+        }
+
+        // 와일드카드(*)가 포함된 경우 — 각 옥텟별 비교
+        if (str_contains($pattern, '*')) {
+            $ipParts = explode('.', $ip);
+            $patParts = explode('.', $pattern);
+            if (count($ipParts) !== 4) return false;
+            for ($i = 0; $i < count($patParts); $i++) {
+                if (!isset($ipParts[$i])) return false;
+                if ($patParts[$i] === '*') continue;
+                if ($patParts[$i] !== $ipParts[$i]) return false;
+            }
+            return true;
+        }
+
+        // 뒤에 점(.)으로 끝나는 경우 — 접두사 매칭 (ex: "192.168.1." → 192.168.1.*)
+        if (str_ends_with($pattern, '.')) {
+            return str_starts_with($ip, $pattern);
+        }
+
+        // 옥텟이 4개 미만이면 접두사 취급 (ex: "192.168.1" → "192.168.1.")
+        if (substr_count($pattern, '.') < 3) {
+            return str_starts_with($ip, $pattern . '.');
+        }
+
+        // 완전 일치
+        return $ip === $pattern;
+    }
+
+    private static function ipInCidr(string $ip, string $cidr): bool
+    {
+        [$subnet, $bits] = explode('/', $cidr, 2);
+        $bits = (int)$bits;
+
+        $ipLong = ip2long($ip);
+        $subLong = ip2long($subnet);
+        if ($ipLong === false || $subLong === false) return false;
+
+        if ($bits === 0) return true;
+        $mask = -1 << (32 - $bits);
+        return ($ipLong & $mask) === ($subLong & $mask);
     }
 }

@@ -25,20 +25,26 @@ class MisCache
         return $this->fileGet($key);
     }
 
-    public function set(string $key, mixed $value, int $ttl = CACHE_TTL): void
+    /**
+     * $realPid 를 명시적으로 넘기지 않으면 key("{real_pid}_{userid}_{hash}")에서 첫 세그먼트만
+     * 추출하는데, real_pid 자체에 언더스코어가 있는 경우(edu_N_G_ag 등) "edu"만 잘려서
+     * invalidateByRealPid() 가 엉뚱한 인덱스를 지워 캐시 무효화가 무동작하는 버그가 있었음
+     * (2026-08-01 확인 — 계획표 작성 직후 목록에 새 행이 하루종일 안 보이던 원인).
+     * 반드시 호출부에서 실제 real_pid 를 명시적으로 전달할 것.
+     */
+    public function set(string $key, mixed $value, int $ttl = CACHE_TTL, ?string $realPid = null): void
     {
+        $realPid = $realPid ?? (explode('_', $key)[0] ?? '');
         if ($this->useApcu) {
             apcu_store($key, $value, $ttl);
-            // real_pid 인덱스 등록
-            $realPid = explode('_', $key)[0] ?? '';
-            if ($realPid) {
+            if ($realPid !== '') {
                 $idx = apcu_fetch("__idx_{$realPid}") ?: [];
                 $idx[$key] = true;
                 apcu_store("__idx_{$realPid}", $idx, $ttl + 60);
             }
             return;
         }
-        $this->fileSet($key, $value, $ttl);
+        $this->fileSet($key, $value, $ttl, $realPid);
     }
 
     public function delete(string $key): void
@@ -134,10 +140,10 @@ class MisCache
         return $raw !== false ? unserialize($raw) : null;
     }
 
-    private function fileSet(string $key, mixed $value, int $ttl): void
+    private function fileSet(string $key, mixed $value, int $ttl, ?string $realPid = null): void
     {
         $path    = $this->getFilePath($key);
-        $realPid = explode('_', $key)[0] ?? '';
+        $realPid = $realPid ?? (explode('_', $key)[0] ?? '');
         @file_put_contents($path, serialize($value), LOCK_EX);
         @file_put_contents($path . '.meta', serialize([
             'real_pid'   => $realPid,

@@ -11,6 +11,7 @@ namespace App\Config;
  * - IFNULL → ISNULL  (CONCAT remains; '+' supported by MSSQL too)
  * - REGEXP / RLIKE → LIKE (best-effort fallback) or PATINDEX
  * - IF(cond, a, b) → CASE WHEN cond THEN a ELSE b END
+ * - DATABASE() → DB_NAME()
  * - SHOW COLUMNS FROM tbl → INFORMATION_SCHEMA.COLUMNS query (Field/Type/Null/Key/Default/Extra aliases)
  * - DATE_FORMAT(d, '%Y-%m-%d') → CONVERT(varchar, d, 23) — partial
  * - Identifier case preserved on AS aliases (matching PHP $row[key]); other refs lowercased
@@ -69,6 +70,7 @@ class MssqlCompatPDO extends \PDO
         $sql = preg_replace('/\bCURDATE\s*\(\s*\)/i', 'CAST(GETDATE() AS date)', $sql);
         $sql = preg_replace('/\bCURTIME\s*\(\s*\)/i', 'CAST(GETDATE() AS time)', $sql);
         $sql = preg_replace('/\bCURRENT_TIMESTAMP\s*\(\s*\)/i', 'GETDATE()', $sql);
+        $sql = preg_replace('/\bDATABASE\s*\(\s*\)/i', 'DB_NAME()', $sql);
         $sql = preg_replace('/\bCHAR_LENGTH\s*\(/i', 'LEN(', $sql);
         $sql = preg_replace('/\bLENGTH\s*\(/i', 'LEN(', $sql);
         $sql = preg_replace('/\boctet_length\s*\(/i', 'DATALENGTH(', $sql);
@@ -89,6 +91,12 @@ class MssqlCompatPDO extends \PDO
         $sql = preg_replace('/\bAS\s+CHAR\s*\((\d+)\)/i', 'AS varchar($1)', $sql);
         $sql = preg_replace('/\bAS\s+CHAR\b(?!\s*\()/i', 'AS varchar(8000)', $sql);
         $sql = preg_replace('/\bAS\s+DATETIME\b/i', 'AS datetime', $sql);
+
+        // 6b) CONVERT 인수 순서 교정.
+        //   MariaDB: CONVERT(expr, TYPE)  →  MSSQL: CONVERT(TYPE, expr)
+        //   잘못된 순서: CONVERT(expr, style, TYPE)  →  MSSQL: CONVERT(TYPE, expr, style)
+        //   MSSQL 은 첫 번째 인수가 반드시 타입이어야 함. 첫 인수가 타입이 아니면 재배치.
+        $sql = self::fixConvertArgOrder($sql);
 
         // 7) IF(cond, a, b) → (CASE WHEN cond THEN a ELSE b END)
         $sql = self::translateIfToCase($sql);
@@ -352,6 +360,81 @@ class MssqlCompatPDO extends \PDO
                     $out .= "(CASE WHEN {$a} THEN {$b} ELSE {$c} END)";
                 } else {
                     $out .= substr($sql, $i, ($j - $i + 1));
+                }
+                $i = $j + 1;
+                continue;
+            }
+            $out .= $sql[$i];
+            $i++;
+        }
+        return $out;
+    }
+
+    /**
+     * CONVERT 인수 순서 교정.
+     *
+     * MSSQL: CONVERT(type, expr [, style])  — 첫 번째 인수가 반드시 타입.
+     * MariaDB 또는 잘못된 순서:
+     *   CONVERT(expr, TYPE)           → CONVERT(TYPE, expr)
+     *   CONVERT(expr, style, TYPE)    → CONVERT(TYPE, expr, style)
+     *
+     * 타입 판별: 첫 인수가 CHAR/VARCHAR/INT/DATE 등 SQL 타입 키워드로 시작하면 이미 정상.
+     * 그 외(컬럼명·표현식)이면 마지막 인수가 타입이라 가정하고 앞으로 이동.
+     */
+    private static function fixConvertArgOrder(string $sql): string
+    {
+        $typeRe = '/^\s*(CHAR|VARCHAR|NCHAR|NVARCHAR|INT|INTEGER|BIGINT|SMALLINT|TINYINT|'
+                . 'FLOAT|REAL|DECIMAL|NUMERIC|DATE|DATETIME|DATETIME2|TIME|BIT|'
+                . 'BINARY|VARBINARY|TEXT|NTEXT|MONEY|SMALLMONEY|XML|'
+                . 'UNIQUEIDENTIFIER|SQL_VARIANT)\b/i';
+
+        $out = '';
+        $i = 0;
+        $n = strlen($sql);
+        while ($i < $n) {
+            // CONVERT( 매칭 — 단 dbo.CONVERT 등 UDF 호출은 제외 (앞에 . 이 있으면 skip)
+            if (preg_match('/\bCONVERT\s*\(/iA', substr($sql, $i), $m)
+                && ($i === 0 || $sql[$i - 1] !== '.')) {
+                $matchLen = strlen($m[0]);
+                $start = $i + $matchLen;
+                // 괄호 내부 인수 파싱
+                $depth = 1; $j = $start; $inStr = false; $args = []; $cur = '';
+                while ($j < $n && $depth > 0) {
+                    $ch = $sql[$j];
+                    if ($inStr) {
+                        $cur .= $ch;
+                        if ($ch === '\\' && $j + 1 < $n) { $cur .= $sql[$j + 1]; $j += 2; continue; }
+                        if ($ch === "'" && $j + 1 < $n && $sql[$j + 1] === "'") { $cur .= "'"; $j += 2; continue; }
+                        if ($ch === "'") $inStr = false;
+                        $j++; continue;
+                    }
+                    if ($ch === "'") { $inStr = true; $cur .= $ch; $j++; continue; }
+                    if ($ch === '(') { $depth++; $cur .= $ch; $j++; continue; }
+                    if ($ch === ')') { $depth--; if ($depth === 0) break; $cur .= $ch; $j++; continue; }
+                    if ($ch === ',' && $depth === 1) { $args[] = $cur; $cur = ''; $j++; continue; }
+                    $cur .= $ch; $j++;
+                }
+                if ($depth !== 0) { $out .= substr($sql, $i); return $out; }
+                $args[] = $cur;
+
+                $first = trim($args[0] ?? '');
+                if (count($args) >= 2 && !preg_match($typeRe, $first)) {
+                    // 첫 인수가 타입이 아님 → 재배치
+                    $lastArg = trim(end($args));
+                    if (count($args) === 2) {
+                        // CONVERT(expr, TYPE) → CONVERT(TYPE, expr)
+                        $out .= "CONVERT({$lastArg}, {$first})";
+                    } else {
+                        // CONVERT(expr, style, TYPE) → CONVERT(TYPE, expr, style)
+                        $middle = [];
+                        for ($k = 1; $k < count($args) - 1; $k++) {
+                            $middle[] = trim($args[$k]);
+                        }
+                        $out .= "CONVERT({$lastArg}, {$first}, " . implode(', ', $middle) . ")";
+                    }
+                } else {
+                    // 이미 정상 순서 — 원본 유지
+                    $out .= substr($sql, $i, $j - $i + 1);
                 }
                 $i = $j + 1;
                 continue;

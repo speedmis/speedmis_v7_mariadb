@@ -65,11 +65,15 @@ class MenuCreator
         if ($len === 4 && $position >= 5 && $menuType === '00') return self::fail('선택한 경로에서는 하위메뉴를 메뉴표시용으로 추가할 수 없습니다.');
         if ($len === 6 && $position <= 4 && $menuType === '00') return self::fail('선택한 경로에서는 메뉴표시용으로 추가할 수 없습니다.');
 
-        // full_siteID = real_pid 접두어
+        // 기준행(srcIdx) real_pid 가 "접두어+숫자" 형식인지 검증(포맷 체크 + AutoGubun 계산용).
         if (!preg_match('/^(.+?)(\d+)$/', $thisRealPid, $m)) {
             return self::fail("real_pid 형식 오류: {$thisRealPid}");
         }
-        $siteId  = $m[1];
+        // 신규 real_pid 접두어는 .env SITE_ID 기준 — 기준행 real_pid 접두어를 그대로 물려받으면
+        // DB를 다른 사이트에서 복제해온 경우(예: choi가 v7ma를 복제) 엉뚱한 사이트 접두어가
+        // 섞여 들어간다(2026-10-05 choi.speedmis.com에서 carparts006167로 생성된 실사고로 발견).
+        // gapm.kr/v7ma/v7ms/v7po/kimgo/choi/localhost 전부 이 core 파일을 공유하므로 한 곳만 고치면 됨.
+        $siteId  = $_ENV['SITE_ID'] ?? $m[1];
         $userId  = (string)($user->uid ?? 'system');
         $now     = date('Y-m-d H:i:s');
 
@@ -82,7 +86,9 @@ class MenuCreator
 
             // 1) 임시 real_pid 로 INSERT → lastInsertId 로 실제 idx 확정 → real_pid 갱신
             //    new_gidx=83, auth_code='02' 기본값 (개발자 전용 권한)
-            $tmpRp = $siteId . '__NEW__' . uniqid();
+            //    real_pid 컬럼이 varchar(14) 라 siteId 길이에 맞춰 뒷부분(고엔트로피) 잘라 붙임
+            $suffixLen = max(4, 14 - strlen($siteId) - 1);
+            $tmpRp     = substr($siteId . '_' . substr(uniqid(), -$suffixLen), 0, 14);
             $insSql = "INSERT INTO mis_menus
                 (real_pid, menu_name, menu_type, up_real_pid, autogubun,
                  sort_g2, sort_g4, sort_g6, depth, useflag,
@@ -205,8 +211,8 @@ class MenuCreator
                           'delete_query','read_only_cond'];
 
         // 새 menu 행의 특정 컬럼을 소스에서 덮어쓰기 (이미 INSERT 된 행에 UPDATE)
-        $updateCols = [];
-        $updateVals = [];
+        // 컬럼명 => 값 맵으로 모아서 마지막 대입이 이기도록 함 (add_logic 등 중복 SET 방지 — SQL Server는 중복 시 에러)
+        $updateMap = [];
         $copyTargets = ['g01','g02','g03','g07','table_name','base_filter','use_condition',
                         'delete_query','read_only_cond','brief_insert_sql','add_logic',
                         'add_logic_treat','add_logic_print','is_use_print','is_use_form',
@@ -217,23 +223,22 @@ class MenuCreator
             if (is_string($v) && $v !== '' && strpos($v, $srcRp) !== false) {
                 $v = str_replace($srcRp, $newRp, $v);
             }
-            $updateCols[] = "`$c` = ?";
-            $updateVals[] = $v;
+            $updateMap[$c] = $v;
         }
         // 파일 내용이 있으면 그것으로 덮어쓰기 (치환 포함)
         if ($fileLogic !== null) {
             $v = strpos($fileLogic, $srcRp) !== false ? str_replace($srcRp, $newRp, $fileLogic) : $fileLogic;
-            $updateCols[] = "`add_logic` = ?";
-            $updateVals[] = $v;
+            $updateMap['add_logic'] = $v;
             $fileLogic = $v;
         }
         if ($filePrint !== null) {
             $v = strpos($filePrint, $srcRp) !== false ? str_replace($srcRp, $newRp, $filePrint) : $filePrint;
-            $updateCols[] = "`add_logic_print` = ?";
-            $updateVals[] = $v;
+            $updateMap['add_logic_print'] = $v;
             $filePrint = $v;
         }
-        if ($updateCols) {
+        if ($updateMap) {
+            $updateCols = array_map(fn($c) => "`$c` = ?", array_keys($updateMap));
+            $updateVals = array_values($updateMap);
             $updateVals[] = $newRp;
             $pdo->prepare('UPDATE mis_menus SET ' . implode(',', $updateCols) . ' WHERE real_pid = ?')
                 ->execute($updateVals);
@@ -390,7 +395,7 @@ class MenuCreator
 
         $upd = $pdo->prepare("
             UPDATE mis_menu_fields
-               SET grid_view_xl = ?, grid_view_lg = ?, grid_view_md = ?, grid_view_sm = ?,
+               SET grid_view_xl = ?, grid_view_lg = ?, grid_view_md = ?, grid_view_sm = ?, grid_view_xs = ?,
                    grid_view_hight = ?, grid_view_class = ?
              WHERE idx = ?
         ");
@@ -428,8 +433,10 @@ class MenuCreator
 
             // Bootstrap 호환 클래스 (기존 314 패턴 따름)
             $cls = "col-xs-{$sm} col-sm-{$md} col-md-{$lg} col-lg-{$xl} row-{$hight}";
+            // XS(<576, 폰 화면)는 필드 종류 무관 항상 전체폭(2026-08-11, grid_view_xs 전용 컬럼 신규 반영)
+            $xs = 12;
 
-            $upd->execute([$xl, $lg, $md, $sm, $hight, $cls, (int)$f['idx']]);
+            $upd->execute([$xl, $lg, $md, $sm, $xs, $hight, $cls, (int)$f['idx']]);
             $updated++;
         }
 
